@@ -1,0 +1,6 @@
+[project]
+name = "croa-reference-harness"
+version = "0.1.0"
+description = "CROA Minimal Reference Harness — a vendor-neutral demonstrator of CROA enforcement (stdlib only)."
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
