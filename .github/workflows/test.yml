@@ -1,0 +1,67 @@
+name: tests
+
+# The harness carries an adversarial suite — including two 100-thread races on
+# authorization reservation and commitment redemption. Those are exactly the tests that
+# fail intermittently if the atomicity is wrong, so they must run on every push, not only
+# on the maintainer's machine. Before September 2026 this repository had no CI at all,
+# which is recorded as an open gap in the CROA repository's GOVERNANCE-DEVIATIONS.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The harness claims Python >= 3.8 and stdlib only. Claiming it is not the same
+        # as testing it.
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      # TODO: pin to a commit SHA. Referencing a mutable major tag is an open supply-chain
+      # gap, tracked in the CROA repository's GOVERNANCE-DEVIATIONS.md.
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Assert the harness has no dependencies
+        run: |
+          if [ -f requirements.txt ] || [ -f poetry.lock ] || [ -f Pipfile ]; then
+            echo "The harness is documented as stdlib-only; a dependency file appeared."
+            exit 1
+          fi
+
+      - name: Run the demonstrator
+        run: python -m mrh
+
+      - name: Run the test suite
+        run: python -m unittest discover -s tests -v
+
+  races:
+    # The concurrency tests are the ones most likely to pass by luck. Running them
+    # repeatedly is cheap and is the only way a scheduling-dependent regression surfaces
+    # before a reader finds it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Repeat the concurrency tests 25 times
+        run: |
+          for i in $(seq 1 25); do
+            python -m unittest \
+              tests.test_mrh.TestAdversarial.test_h01_concurrent_reservation_admits_one \
+              tests.test_mrh.TestAdversarial.test_h01_concurrent_redemption_admits_one \
+              || { echo "Concurrency test failed on iteration $i"; exit 1; }
+          done
+          echo "25 iterations, no interleaving admitted more than one."
