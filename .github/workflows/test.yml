@@ -57,6 +57,30 @@ jobs:
             evidence_pack.json
             c5_log.jsonl
 
+  p4-boundary:
+    # H-06. The one property the demonstrator could not demonstrate, given its own
+    # named check so a reader can see it pass or fail without reading a matrix cell.
+    #
+    # Three OS processes. The governed system is reachable only through a file
+    # descriptor C6 holds, and every assertion is on that system's own log file --
+    # never on a return value from the code under test.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: A direct path that fails in the kernel, and a governed one that does not
+        run: python -m unittest tests.test_p4 -v
+      - name: Repeat it 10 times
+        # The bench spawns processes and waits on a socket. A boundary test that passes
+        # once and is flaky is worse than none, because it will be cited.
+        run: |
+          for i in $(seq 1 10); do
+            python -m unittest tests.test_p4 -q \
+              || { echo "P4 boundary failed on iteration $i"; exit 1; }
+          done
+
   races:
     # The concurrency tests are the ones most likely to pass by luck. Running them
     # repeatedly is cheap and is the only way a scheduling-dependent regression surfaces
