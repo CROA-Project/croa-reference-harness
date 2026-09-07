@@ -85,7 +85,7 @@ def nt002_expired_ecc_blocked():
     now = time.time()
     action = _read()
     pid = _permit_event(h, action)
-    ecc = h.c7.compile(action, now, permit_event_id=pid, ttl=1)
+    ecc = h.c7.compile(h.c3.ground(action), action["subject_id"], now, permit_event_id=pid, ttl=1)
     _record_compiled(h, ecc, pid)
     r = h.present(ecc, now + 60, "cs-agent-01", action)
     unspent = not h.registry.is_spent(ecc["ecc.id"])
@@ -165,7 +165,7 @@ def nt007_governed_exception_single_use():
     auth2 = h2.c1.issue_authorization(action2, now)
     pid = _permit_event(h2, action2, basis="PERMIT_WITH_AUTHORIZATION",
                         auth_id=auth2["auth_id"])
-    ecc2 = h2.c7.compile(action2, now, permit_event_id=pid, authorization=auth2)
+    ecc2 = h2.c7.compile(h2.c3.ground(action2), action2["subject_id"], now, permit_event_id=pid, authorization=auth2)
     _record_compiled(h2, ecc2, pid)
     results = []
     lock = threading.Lock()
@@ -217,7 +217,7 @@ def exception_scope_enforced_independently():
     action = _export(target="billing")
     auth = h.c1.issue_authorization(action, now)          # waives billing only
     pid = _permit_event(h, action, basis="PERMIT_WITH_AUTHORIZATION", auth_id=auth["auth_id"])
-    ecc = h.c7.compile(action, now, permit_event_id=pid, authorization=auth,
+    ecc = h.c7.compile(h.c3.ground(action), action["subject_id"], now, permit_event_id=pid, authorization=auth,
                        additional_scope=[{"target": "analytics",
                                           "action_type": "data.export"}])
     _record_compiled(h, ecc, pid)
@@ -245,7 +245,7 @@ def shared_registry_across_firewalls():
     now = time.time()
     action = _read()
     pid = _permit_event(h, action)
-    ecc = h.c7.compile(action, now, permit_event_id=pid)
+    ecc = h.c7.compile(h.c3.ground(action), action["subject_id"], now, permit_event_id=pid)
     _record_compiled(h, ecc, pid)
     a = h.present(ecc, now, "cs-agent-01", action, firewall=h.firewalls[0])
     b = h.present(ecc, now, "cs-agent-01", action, firewall=h.firewalls[1])
@@ -377,8 +377,8 @@ def h01_one_authorization_one_execution():
     auth = h.c1.issue_authorization(action, now)
     pid1 = _permit_event(h, action, basis="PERMIT_WITH_AUTHORIZATION", auth_id=auth["auth_id"])
     pid2 = _permit_event(h, action, basis="PERMIT_WITH_AUTHORIZATION", auth_id=auth["auth_id"])
-    ecc1 = h.c7.compile(action, now, permit_event_id=pid1, authorization=auth)
-    ecc2 = h.c7.compile(action, now, permit_event_id=pid2, authorization=auth)
+    ecc1 = h.c7.compile(h.c3.ground(action), action["subject_id"], now, permit_event_id=pid1, authorization=auth)
+    ecc2 = h.c7.compile(h.c3.ground(action), action["subject_id"], now, permit_event_id=pid2, authorization=auth)
     _record_compiled(h, ecc1, pid1)
     _record_compiled(h, ecc2, pid2)
     a = h.present(ecc1, now, "cs-agent-01", action)
@@ -396,7 +396,7 @@ def h02_subject_substitution_blocked():
     now = time.time()
     action = _read()
     pid = _permit_event(h, action)
-    ecc = h.c7.compile(action, now, permit_event_id=pid)
+    ecc = h.c7.compile(h.c3.ground(action), action["subject_id"], now, permit_event_id=pid)
     _record_compiled(h, ecc, pid)
     r = h.present(ecc, now, "intruder-99", action)
     ok = r["admitted"] is False and r.get("block_detail") == "SUBJECT_MISMATCH"
@@ -409,7 +409,7 @@ def h02b_operation_substitution_blocked():
     now = time.time()
     action = _read()
     pid = _permit_event(h, action)
-    ecc = h.c7.compile(action, now, permit_event_id=pid)
+    ecc = h.c7.compile(h.c3.ground(action), action["subject_id"], now, permit_event_id=pid)
     _record_compiled(h, ecc, pid)
     r = h.present(ecc, now, "cs-agent-01", _export(target="analytics"))
     ok = (r["admitted"] is False
@@ -424,7 +424,7 @@ def h03_content_addressed_id():
     now = time.time()
     action = _read()
     pid = _permit_event(h, action)
-    ecc = h.c7.compile(action, now, permit_event_id=pid)
+    ecc = h.c7.compile(h.c3.ground(action), action["subject_id"], now, permit_event_id=pid)
     content = dict((k, v) for k, v in ecc.items() if k not in ("ecc.id", "ecc.signature"))
     recomputed = "ecc-" + hashlib.sha256(_canon(content).encode()).hexdigest()
     addressed = ecc["ecc.id"] == recomputed
@@ -451,7 +451,7 @@ def h04_double_authorization_detected():
     auth_id = "auth-forged"
     for _ in range(2):
         pid = _permit_event(h, action, basis="PERMIT_WITH_AUTHORIZATION", auth_id=auth_id)
-        ecc = h.c7.compile(action, now, permit_event_id=pid)
+        ecc = h.c7.compile(h.c3.ground(action), action["subject_id"], now, permit_event_id=pid)
         _record_compiled(h, ecc, pid)
         h.c5.emit("EXECUTION_AUTHORIZED", "C6", "cs-agent-01", **{
             "event.ecc_id": ecc["ecc.id"],

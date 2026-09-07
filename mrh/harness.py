@@ -30,6 +30,7 @@ from .components import (
     ExecutionGovernor,
     PathResolver,
     PolicyAuthority,
+    request_of,
 )
 from .delegation import DelegationRejected, Scope, build_chain, verify_token
 from .redemption import InProcessRegistry
@@ -94,7 +95,11 @@ class Harness(object):
                 return self._reject(action, session_id, gar_id, rejection, detail,
                                     None, delegation_hops)
 
-        if not self.c3.resolve(action["target"]):
+        # §4.5.1: C3 produces the grounded governed action, it does not answer yes or
+        # no. Everything downstream carries `gga` from here, and `ecc.action` is
+        # required to be exactly this object -- the remaining half of H-03.
+        gga = self.c3.ground(action, now)
+        if gga is None:
             self.c5.emit("CONTEXT_FAILURE", "C3", sid, **{
                 "event.session_id": session_id,
                 "event.action_spec": action,
@@ -181,7 +186,8 @@ class Harness(object):
 
         try:
             ecc = self.c7.compile(
-                action, now, permit_event_id=permit_ev["event.id"],
+                gga, sid, now, permit_event_id=permit_ev["event.id"],
+                session_id=session_id,
                 authorization=(authorization if decision == "PERMIT_WITH_AUTHORIZATION" else None),
             )
         except AuthorizationInvalid as exc:
@@ -248,7 +254,10 @@ class Harness(object):
         is must not change the outcome.
         """
         if operation is None and ecc is not None:
-            operation = ecc["ecc.action"]
+            # The concrete operation, projected out of the grounded action. The
+            # grounding record stays in the contract where an assessor can read it; it
+            # is not something C6 compares against.
+            operation = request_of(ecc["ecc.action"])
         c6 = firewall if firewall is not None else self.c6
 
         status, block_reason, detail = c6.redeem(

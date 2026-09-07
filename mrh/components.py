@@ -28,9 +28,11 @@ authorization backs at most one admitted execution. It is now enforced at the bo
 instead of at the compiler, which is both the specified place and the only place that
 holds when there is more than one compiler.
 """
+import datetime
 import hashlib
 import hmac
 import json
+import time
 import uuid
 
 from .invariants import AMBIGUOUS, VIOLATED, Invariant, InvariantRegistry
@@ -39,12 +41,52 @@ from .trajectory import C4Unavailable
 _ECC_KEY = b"CROA-MRH-ECC-DEMO-KEY"
 
 
+def _iso(epoch_seconds):
+    """ecc.schema.json types the contract's timestamps as date-times, not as epoch
+    floats. Emitting a float there is not a formatting preference: an assessor handed
+    `1788783682.4` cannot tell a second from a millisecond without knowing which
+    language produced it, which is exactly the reconstructability §4.4.1 asks for."""
+    return datetime.datetime.fromtimestamp(
+        epoch_seconds, datetime.timezone.utc).isoformat()
+
+
+def _epoch(iso):
+    return datetime.datetime.fromisoformat(iso).timestamp()
+
+
+#: Fields that identify *where* a request came from rather than *what* it does.
+#: An authorization is bounded to an operation (§4.3.1: action class, target, window),
+#: so binding it to these as well would refuse the same authorized operation merely
+#: because it arrived in a different session -- a constraint §4.3.1 does not impose.
+_CONTEXTUAL_FIELDS = ("session_id", "gar_id")
+
+
+def operation_fingerprint(action, subject_id=None):
+    """Canonical identity of the operation an authorization is bound to."""
+    op = dict((k, v) for k, v in action.items() if k not in _CONTEXTUAL_FIELDS)
+    if subject_id is not None:
+        op["subject_id"] = subject_id
+    return hashlib.sha256(_canon(op).encode()).hexdigest()
+
+
 def _canon(o):
     return json.dumps(o, sort_keys=True, separators=(",", ":"))
 
 
 class CommitmentMismatch(Exception):
     """What is presented at the boundary is not what the contract authorizes."""
+
+
+class NotGrounded(Exception):
+    """C7 was handed something other than C3's grounded governed action. Raising is
+    the point: an ECC compiled from an ungrounded request is the remaining half of
+    H-03, and it must not be constructible."""
+
+
+class PolicyIncomplete(Exception):
+    """C1 was asked for something it has not been told. Fail-deny, never a default:
+    §2.6's rule is that a determination which cannot be made is a determination that
+    failed, and a silently assumed R0 is the most expensive possible guess."""
 
 
 class AuthorizationInvalid(Exception):
@@ -60,15 +102,74 @@ class PolicyAuthority(object):
     """Holds registered invariants and issues signed, time-bounded authorization
     artifacts for governed exceptions (§4.3.1). The agent can never issue these."""
 
+    #: Reversibility class per governed action class (Part I, T5; §4.4.1). An ECC
+    #: carries the class of the transition it authorizes, so an assessor can see what
+    #: was at stake without re-deriving it. There is no default on purpose: an action
+    #: class whose consequence nobody has classified is one nobody has thought about,
+    #: and C7 fails-deny rather than guessing R0.
+    DEFAULT_REVERSIBILITY = {
+        "data.read": "R0",          # fully reversible: a read changes nothing
+        "data.export": "R2",        # irreversible, low impact: the copy is out
+        "report.generate": "R1",    # compensatable: the report can be withdrawn
+        "sql.execute": "R3",        # irreversible, high impact
+        "infra.delete": "R4",       # irreversible, catastrophic
+    }
+
+    #: Controls recorded in the ECC for any transition of class R1 or above
+    #: (§2.5.1, T5; required by ecc.schema.json whenever the class is not R0). Only R1
+    #: admits an actual compensation; above it the recorded control is *preventive*,
+    #: and calling it compensatory would be the false comfort T5 exists to refuse.
+    DEFAULT_CONTROLS = {
+        "R1": [{"control_id": "CTL-COMPENSATE-01", "kind": "compensating",
+                "description": "Inverse operation available; the transition can be "
+                               "undone by an operator without data loss."}],
+        "R2": [{"control_id": "CTL-PREAUTH-01", "kind": "preventive",
+                "description": "T5 pre-execution authorization beyond the standard "
+                               "permit decision. No inverse path exists."}],
+        "R3": [{"control_id": "CTL-STAGED-01", "kind": "preventive",
+                "description": "Staged execution with an abort point, and enhanced "
+                               "monitoring of the target for the duration."}],
+        "R4": [{"control_id": "CTL-DUAL-01", "kind": "preventive",
+                "description": "Dual authorization and a mandatory hold window. "
+                               "Nothing compensates an R4 transition."}],
+    }
+
     def __init__(self, approved_export_targets, invariant_set_version="inv-2026-09-01",
-                 policy_artifact_id="pol-core-data-protection@1.4.0", registry=None):
+                 policy_artifact_id="pol-core-data-protection@1.4.0", registry=None,
+                 reversibility=None, controls=None):
         self.approved_export_targets = set(approved_export_targets)
+        self.reversibility = dict(reversibility if reversibility is not None
+                                  else self.DEFAULT_REVERSIBILITY)
+        self.controls = dict(controls if controls is not None else self.DEFAULT_CONTROLS)
         # §4.7.1 requires every decision event to name the C1 artifact it was issued
         # under, so a decision can be re-derived years later against the policy that
         # actually applied to it (I3).
         self.policy_artifact_id = policy_artifact_id
         self.registry = registry if registry is not None else self._default_registry()
         self.registry.version = invariant_set_version
+
+    def reversibility_class_for(self, action_class):
+        """§4.4.1: raises rather than defaulting. See DEFAULT_REVERSIBILITY."""
+        try:
+            return self.reversibility[action_class]
+        except KeyError:
+            raise PolicyIncomplete(
+                "no reversibility class registered for action class %r; C1 cannot "
+                "authorize a transition whose consequence class is undeclared"
+                % action_class)
+
+    def compensating_controls_for(self, reversibility_class):
+        """The controls an ECC must record for this class. Empty for R0, which is the
+        only class the schema lets an ECC carry none for."""
+        if reversibility_class == "R0":
+            return []
+        try:
+            return [dict(c) for c in self.controls[reversibility_class]]
+        except KeyError:
+            raise PolicyIncomplete(
+                "no compensating or preventive control registered for reversibility "
+                "class %r; T5 does not permit an irreversible transition to be "
+                "authorized with nothing recorded against it" % reversibility_class)
 
     @property
     def invariant_set_version(self):
@@ -122,14 +223,16 @@ class PolicyAuthority(object):
         """
         auth = {
             "auth_id": "auth-" + uuid.uuid4().hex[:12],
-            "action_fingerprint": hashlib.sha256(_canon(action).encode()).hexdigest(),
+            "action_fingerprint": operation_fingerprint(action),
             "expiry": now + ttl,
             "redemption_policy": "single-use",
             "exception_scope": {
                 "waived_invariants": list(waived),
                 "action_class": action["action_class"],
                 "target_constraints": [action["target"]],
-                "expires_at": now + ttl,
+                # date-time, not an epoch float: this object is copied verbatim into
+                # the ECC and is validated there.
+                "expires_at": _iso(now + ttl),
             },
         }
         auth["signature"] = hmac.new(_ECC_KEY, _canon(auth).encode(), hashlib.sha256).hexdigest()
@@ -152,9 +255,7 @@ class PolicyAuthority(object):
         if now > auth["expiry"]:
             return False
         return hmac.compare_digest(
-            auth["action_fingerprint"],
-            hashlib.sha256(_canon(action).encode()).hexdigest(),
-        )
+            auth["action_fingerprint"], operation_fingerprint(action))
 
 
 # --- C3: Path Resolver ----------------------------------------------------
@@ -167,14 +268,78 @@ class PathResolver(object):
     pipeline MUST NOT fall through to C2.
     """
 
+    NON_PARAMETER_FIELDS = ("subject_id", "action_class", "target", "session_id",
+                            "gar_id")
+
     def __init__(self, context_registry, available=True):
         self.context_registry = set(context_registry)
         self.available = available
 
     def resolve(self, target):
+        """The membership test alone. Kept because two negative tests assert on it
+        directly; the pipeline uses `ground` below."""
         if not self.available:
             return False
         return target in self.context_registry
+
+    def ground(self, action, now=None):
+        """Return the grounded governed action (`gga.*`) for a request, or None.
+
+        §4.5.1: C3 does not answer yes or no, it *produces an artifact* -- the request
+        plus the record of what was resolved against the registry and what was not.
+        That record is what makes a decision reconstructable months later, and it is
+        what `ecc.action` is required to carry.
+
+        `now` is a parameter rather than a call to the clock, because `resolved_at` is
+        part of the grounding record, the grounding record is part of the ECC, and
+        `ecc.id` is a content address over it. A hidden clock reading here would make
+        the contract identity non-reproducible -- grounding the same request twice a
+        microsecond apart would yield two contracts. That is *correct*: a grounding has
+        a time, and a contract built on a later grounding is a different contract. It
+        just must not happen by accident.
+
+        The harness previously returned a boolean here and passed the raw request
+        onward. Everything downstream then described a governed action that had never
+        been grounded by anything, and the ECC could not validate against its own
+        schema -- recorded as the remaining half of H-03.
+
+        Returns None when grounding fails **or cannot be performed**: §4.5 is explicit
+        that an unreachable or stale registry is treated as a grounding that failed,
+        and the caller must not fall through to C2. The two cases are distinguishable
+        by `self.available`, because C5 records them differently.
+        """
+        if not self.available or action["target"] not in self.context_registry:
+            return None
+        now = time.time() if now is None else now
+        parameters = dict((k, v) for k, v in action.items()
+                          if k not in self.NON_PARAMETER_FIELDS)
+        return {
+            # Deterministic when the caller supplies no GAR id. A random one here
+            # would make `ecc.id` non-reproducible, and `ecc.id` is a content address:
+            # grounding the same request twice must yield the same contract identity,
+            # or H-03's whole property is decorative.
+            "gga.request_id": action.get(
+                "gar_id", "gar-" + operation_fingerprint(action)[:16]),
+            "gga.type": action["action_class"],
+            "gga.target": action["target"],
+            "gga.parameters": parameters,
+            # Every reference this request made, resolved. The demonstrator grounds one
+            # entity -- the target -- so the list has one member; a deployment resolves
+            # every reference in the request against the Federated Context Registry.
+            "gga.resolved_entities": [{
+                "canonical_id": action["target"],
+                # All this registry can attest is membership. A deployment records what
+                # it actually resolved to -- a schema version, a repository HEAD, a
+                # document revision -- and `state` is where that goes. Writing
+                # "PRESENT" is the honest ceiling of a set-membership registry, and
+                # saying so is better than inventing a richer state it never read.
+                "state": "PRESENT",
+                "resolved_at": _iso(now),
+                "registry": "mrh-context-registry",
+            }],
+            "gga.unresolved_refs": [],
+            "gga.semantic_result": "GROUNDED",
+        }
 
 
 # --- C2: Execution Governor ----------------------------------------------
@@ -274,12 +439,30 @@ class ExecutionGovernor(object):
 class ContractCompiler(object):
     """Compiles a permitted action into the single artifact allowed across TB-3."""
 
-    def __init__(self, c1):
+    def __init__(self, c1, signer_id="c7-mrh-demonstrator"):
         self.c1 = c1
+        # §4.4.1 requires the contract to name who signed it, for the same reason
+        # §4.7.1 requires it of an event: a signature nobody is named for cannot be
+        # revoked, rotated, or disbelieved.
+        self.signer_id = signer_id
 
-    def compile(self, action, now, permit_event_id, authorization=None, ttl=300,
-                additional_scope=None):
+    def compile(self, gga, subject_id, now, permit_event_id, session_id=None,
+                authorization=None, ttl=300, additional_scope=None):
         """Produce an ECC (§4.4.1).
+
+        `subject_id` is the **authenticated** identity the permit was issued for, and it
+        is mandatory. It used to be read out of the request payload, which is the same
+        mistake H-02 fixed at the boundary and left standing here: a contract must be
+        compiled for whoever the decision was about, not for whoever the request says.
+        The grounded action carries no subject, and the schema is right that it should
+        not -- the subject belongs to the GAR and to the contract, not to the grounding.
+
+        `gga` is the **grounded governed action** produced by C3, not the raw request.
+        The distinction is the remaining half of H-03: a contract carrying the request
+        describes an action nothing has grounded, and `ecc.action` is required by
+        §4.5.1 and by the schema to be a GROUNDED `gga.*`. Passing anything else raises
+        rather than compiling something that will not validate -- the unsafe call is not
+        expressible, which is the shape the H-02 fix used for the same reason.
 
         FIX H-03: `ecc.id` is the SHA-256 of the contract's canonical content with no
         random component. The content includes `ecc.permit_event_id`, unique per
@@ -296,22 +479,40 @@ class ContractCompiler(object):
         converse holds too -- a broader permit does not widen the waiver. C6 enforces
         both, so an operation inside the permit but outside the waiver is refused.
         """
+        if not isinstance(gga, dict) or gga.get("gga.semantic_result") != "GROUNDED":
+            raise NotGrounded(
+                "ecc.action must be a grounded governed action from C3 "
+                "(gga.semantic_result == GROUNDED); got %r"
+                % (gga.get("gga.semantic_result") if isinstance(gga, dict) else type(gga).__name__))
+
+        action = self._request_of(gga)
+        reversibility = self.c1.reversibility_class_for(action["action_class"])
         content = {
-            "ecc.action": action,
-            "ecc.subject": action["subject_id"],
-            "ecc.session_id": action.get("session_id", "sess-" + action["subject_id"]),
+            "ecc.action": gga,
+            "ecc.subject": subject_id,
+            "ecc.session_id": session_id or ("sess-" + subject_id),
             "ecc.permit_event_id": permit_event_id,
-            "ecc.compiled_at": now,
-            "ecc.expires_at": now + ttl,
+            "ecc.policy_artifact_id": self.c1.policy_artifact_id,
+            "ecc.reversibility_class": reversibility,
+            "ecc.compiled_at": _iso(now),
+            "ecc.expires_at": _iso(now + ttl),
             "ecc.invariant_set_version": self.c1.invariant_set_version,
+            "ecc.signer_id": self.signer_id,
             "ecc.authorization_scope": [{
                 "target": action["target"],
                 "action_type": action["action_class"],
             }] + list(additional_scope or []),
             "ecc.decision_basis": "PERMIT" if authorization is None else "PERMIT_WITH_AUTHORIZATION",
         }
+        controls = self.c1.compensating_controls_for(reversibility)
+        if controls:
+            # Required by the schema for R1 and above, and absent for R0 -- recording
+            # an empty list against a fully reversible transition would suggest someone
+            # looked for a control and found none.
+            content["ecc.compensating_controls"] = controls
         if authorization is not None:
-            if not self.c1.authorization_valid_for(authorization, action, now):
+            if not self.c1.authorization_valid_for(
+                    authorization, dict(action, subject_id=subject_id), now):
                 raise AuthorizationInvalid("authorization invalid, expired, or not bound to this action")
             content["ecc.auth_ref"] = authorization["auth_id"]
             content["ecc.exception_scope"] = authorization["exception_scope"]
@@ -325,8 +526,26 @@ class ContractCompiler(object):
         ).hexdigest()
         return ecc
 
+    @staticmethod
+    def _request_of(gga):
+        return request_of(gga)
+
 
 # --- C6: Execution Firewall ----------------------------------------------
+def request_of(gga):
+    """Project a grounded governed action back to the concrete operation it describes.
+
+    C6 compares an *operation* -- what the presenter is actually asking to do -- against
+    the contract. That comparison is over the action class, the target and the
+    parameters, which is what this returns. It is not a reconstruction of the original
+    request and must not be treated as one: the grounding record stays in the ECC,
+    where an assessor can see it.
+    """
+    op = {"action_class": gga["gga.type"], "target": gga["gga.target"]}
+    op.update(gga.get("gga.parameters") or {})
+    return op
+
+
 class ExecutionFirewall(object):
     """The execution boundary (§4.8).
 
@@ -399,7 +618,7 @@ class ExecutionFirewall(object):
             return "BLOCKED", "ECC_INTEGRITY_INVALID", "SIGNATURE_INVALID"
         if not self._content_address_ok(ecc):
             return "BLOCKED", "ECC_INTEGRITY_INVALID", "ID_NOT_CONTENT_ADDRESSED"
-        if now > ecc["ecc.expires_at"]:
+        if now > _epoch(ecc["ecc.expires_at"]):
             return "BLOCKED", "ECC_EXPIRED", None
         if subject_id != ecc["ecc.subject"]:
             return "BLOCKED", "ECC_INTEGRITY_INVALID", "SUBJECT_MISMATCH"
