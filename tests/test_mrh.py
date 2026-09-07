@@ -1,3 +1,4 @@
+import datetime
 import hashlib
 import hmac
 import os
@@ -58,7 +59,7 @@ class TestRedemptionRegistry(unittest.TestCase):
         """100 threads present one ECC. The registry must grant once."""
         h = Harness()
         pid = permit(h, READ)
-        ecc = h.c7.compile(READ, self.now, permit_event_id=pid)
+        ecc = h.c7.compile(h.c3.ground(READ), READ["subject_id"], self.now, permit_event_id=pid)
         admitted, lock = [], threading.Lock()
 
         def attempt():
@@ -79,7 +80,7 @@ class TestRedemptionRegistry(unittest.TestCase):
         """100 threads present 100 distinct ECCs sharing one authorization."""
         h = Harness()
         auth = h.c1.issue_authorization(EXPORT, self.now)
-        eccs = [h.c7.compile(EXPORT, self.now, permit_event_id=permit(h, EXPORT),
+        eccs = [h.c7.compile(h.c3.ground(EXPORT), EXPORT["subject_id"], self.now, permit_event_id=permit(h, EXPORT),
                              authorization=auth) for _ in range(100)]
         admitted, lock = [], threading.Lock()
 
@@ -107,7 +108,7 @@ class TestRedemptionRegistry(unittest.TestCase):
     def test_two_instances_one_registry_admit_once(self):
         h = Harness(firewalls=2)
         pid = permit(h, READ)
-        ecc = h.c7.compile(READ, self.now, permit_event_id=pid)
+        ecc = h.c7.compile(h.c3.ground(READ), READ["subject_id"], self.now, permit_event_id=pid)
         scenarios._record_compiled(h, ecc, pid)
         a = h.present(ecc, self.now, "cs-agent-01", READ, firewall=h.firewalls[0])
         b = h.present(ecc, self.now, "cs-agent-01", READ, firewall=h.firewalls[1])
@@ -124,7 +125,7 @@ class TestRedemptionRegistry(unittest.TestCase):
                        ExecutionFirewall(InProcessRegistry(), "c6-2")]
         h.c6 = h.firewalls[0]
         pid = permit(h, READ)
-        ecc = h.c7.compile(READ, self.now, permit_event_id=pid)
+        ecc = h.c7.compile(h.c3.ground(READ), READ["subject_id"], self.now, permit_event_id=pid)
         scenarios._record_compiled(h, ecc, pid)
         h.present(ecc, self.now, "cs-agent-01", READ, firewall=h.firewalls[0])
         h.present(ecc, self.now, "cs-agent-01", READ, firewall=h.firewalls[1])
@@ -137,7 +138,7 @@ class TestRedemptionRegistry(unittest.TestCase):
         static checks run before the claim, so a refusal costs nothing."""
         h = Harness()
         pid = permit(h, READ)
-        ecc = h.c7.compile(READ, self.now, permit_event_id=pid, ttl=1)
+        ecc = h.c7.compile(h.c3.ground(READ), READ["subject_id"], self.now, permit_event_id=pid, ttl=1)
         h.present(ecc, self.now + 60, "cs-agent-01", READ)
         self.assertFalse(h.registry.is_spent(ecc["ecc.id"]))
 
@@ -224,9 +225,9 @@ class TestAdversarial(unittest.TestCase):
         boundary, and §4.8 explicitly anticipates a second ECC being compiled against a
         spent authorization. Two ECCs may exist; only one may be admitted."""
         auth = self.h.c1.issue_authorization(EXPORT, self.now)
-        e1 = self.h.c7.compile(EXPORT, self.now, permit_event_id=permit(self.h, EXPORT),
+        e1 = self.h.c7.compile(self.h.c3.ground(EXPORT), EXPORT["subject_id"], self.now, permit_event_id=permit(self.h, EXPORT),
                                authorization=auth)
-        e2 = self.h.c7.compile(EXPORT, self.now, permit_event_id=permit(self.h, EXPORT),
+        e2 = self.h.c7.compile(self.h.c3.ground(EXPORT), EXPORT["subject_id"], self.now, permit_event_id=permit(self.h, EXPORT),
                                authorization=auth)
         self.assertNotEqual(e1["ecc.id"], e2["ecc.id"])
         self.assertEqual(e1["ecc.auth_ref"], auth["auth_id"])
@@ -249,13 +250,13 @@ class TestAdversarial(unittest.TestCase):
     def test_expired_authorization_never_compiles(self):
         auth = self.h.c1.issue_authorization(EXPORT, self.now, ttl=1)
         with self.assertRaises(AuthorizationInvalid):
-            self.h.c7.compile(EXPORT, self.now + 60,
+            self.h.c7.compile(self.h.c3.ground(EXPORT), EXPORT["subject_id"], self.now + 60,
                               permit_event_id=permit(self.h, EXPORT), authorization=auth)
 
     # -------------------------------------------------------------- H-02
     def test_h02_subject_substitution_blocked(self):
         action = dict(READ, subject_id="subject-A")
-        ecc = self.h.c7.compile(action, self.now,
+        ecc = self.h.c7.compile(self.h.c3.ground(action), action["subject_id"], self.now,
                                 permit_event_id=permit(self.h, action, "subject-A"))
         r = self.h.present(ecc, self.now, "subject-B", action)
         self.assertFalse(r["admitted"])
@@ -265,14 +266,14 @@ class TestAdversarial(unittest.TestCase):
                              for e in self.h.c5.events))
 
     def test_h02_operation_mutation_blocked(self):
-        ecc = self.h.c7.compile(READ, self.now, permit_event_id=permit(self.h, READ))
+        ecc = self.h.c7.compile(self.h.c3.ground(READ), READ["subject_id"], self.now, permit_event_id=permit(self.h, READ))
         r = self.h.present(ecc, self.now, "cs-agent-01", dict(READ, target="billing"))
         self.assertFalse(r["admitted"])
         self.assertEqual(r["block_detail"], "OPERATION_OUTSIDE_AUTHORIZATION_SCOPE")
 
     # -------------------------------------------------------------- H-03
     def test_h03_ecc_id_is_content_address(self):
-        ecc = self.h.c7.compile(READ, self.now, permit_event_id=permit(self.h, READ))
+        ecc = self.h.c7.compile(self.h.c3.ground(READ), READ["subject_id"], self.now, permit_event_id=permit(self.h, READ))
         content = dict((k, v) for k, v in ecc.items()
                        if k not in ("ecc.id", "ecc.signature"))
         expected = "ecc-" + hashlib.sha256(_canon(content).encode()).hexdigest()
@@ -280,15 +281,19 @@ class TestAdversarial(unittest.TestCase):
 
     def test_h03_same_inputs_same_id(self):
         pid = permit(self.h, READ)
-        a = self.h.c7.compile(READ, self.now, permit_event_id=pid)
-        b = self.h.c7.compile(READ, self.now, permit_event_id=pid)
+        # One grounding, compiled twice. Grounding twice would be two *different*
+        # groundings -- each carries its own resolved_at -- and a content address that
+        # ignored that would be addressing something other than the content.
+        gga = self.h.c3.ground(READ, self.now)
+        a = self.h.c7.compile(gga, READ["subject_id"], self.now, permit_event_id=pid)
+        b = self.h.c7.compile(gga, READ["subject_id"], self.now, permit_event_id=pid)
         self.assertEqual(a["ecc.id"], b["ecc.id"])
 
     def test_h03_forged_id_refused(self):
         """The forged ECC is re-signed, so the signature check passes and the
         content-address check is the one that must fire. Without the re-signing this
         test would pass on the signature branch and leave the address check dead."""
-        ecc = dict(self.h.c7.compile(READ, self.now, permit_event_id=permit(self.h, READ)))
+        ecc = dict(self.h.c7.compile(self.h.c3.ground(READ), READ["subject_id"], self.now, permit_event_id=permit(self.h, READ)))
         ecc["ecc.id"] = "ecc-" + "0" * 64
         ecc["ecc.signature"] = hmac.new(
             _ECC_KEY,
@@ -300,7 +305,7 @@ class TestAdversarial(unittest.TestCase):
                          "the content-address check must be the branch that fires")
 
     def test_forged_signature_refused(self):
-        ecc = dict(self.h.c7.compile(READ, self.now, permit_event_id=permit(self.h, READ)))
+        ecc = dict(self.h.c7.compile(self.h.c3.ground(READ), READ["subject_id"], self.now, permit_event_id=permit(self.h, READ)))
         ecc["ecc.signature"] = "0" * 64
         r = self.h.present(ecc, self.now, "cs-agent-01", READ)
         self.assertFalse(r["admitted"])
@@ -309,7 +314,7 @@ class TestAdversarial(unittest.TestCase):
     def test_stale_invariant_set_refused(self):
         """§4.8: C6 verifies the ECC's invariant-set version against the current
         registry and refuses a contract compiled under a superseded one."""
-        ecc = self.h.c7.compile(READ, self.now, permit_event_id=permit(self.h, READ))
+        ecc = self.h.c7.compile(self.h.c3.ground(READ), READ["subject_id"], self.now, permit_event_id=permit(self.h, READ))
         self.h.c1.invariant_set_version = "inv-2026-10-01"     # registry moved on
         r = self.h.present(ecc, self.now, "cs-agent-01", READ)
         self.assertFalse(r["admitted"])
@@ -395,6 +400,105 @@ class TestEventSchemaConformance(unittest.TestCase):
                          "EXECUTION_BLOCKED", "CONTEXT_FAILURE", "EXECUTION_COMPLETED",
                          "EFFECT_ATTESTED"):
             self.assertIn(required, seen)
+
+
+class TestEccSchemaConformance(unittest.TestCase):
+    """Every ECC the harness compiles must validate against the published
+    ecc.schema.json.
+
+    H-03's other half. The event half of that defect was closed in September 2026 and
+    the ECC half was not, for a reason worth stating: **no test looked**. The event
+    conformance test above passed throughout, and a green suite covering the object
+    beside the broken one is what kept anyone from checking. This class exists so that
+    the ECC cannot drift from its schema without something going red.
+
+    ecc.schema.json `$ref`s gga.schema.json, so the four schemas are loaded into a
+    registry rather than validated in isolation -- which is also what makes this test
+    check the thing that actually matters: `ecc.action` must be a *grounded governed
+    action*, not whatever dictionary the caller happened to pass in.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from jsonschema import Draft202012Validator
+            from referencing import Registry, Resource
+        except ImportError:
+            raise unittest.SkipTest("jsonschema >= 4.18 not installed")
+        import json
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidates = [os.environ.get("CROA_SCHEMA_DIR"),
+                      os.path.join(here, "..", "CROA", "spec", "schemas")]
+        d = None
+        for c in candidates:
+            if c and os.path.exists(os.path.join(c, "ecc.schema.json")):
+                d = c
+                break
+        if d is None:
+            raise unittest.SkipTest("ecc.schema.json not found (set CROA_SCHEMA_DIR)")
+        pairs, ecc = [], None
+        for name in ("gar", "gga", "ecc", "event"):
+            with open(os.path.join(d, name + ".schema.json"), encoding="utf-8") as fh:
+                doc = json.load(fh)
+            res = Resource.from_contents(doc)
+            # Registered under both the declared $id and the bare filename, because the
+            # schemas reference each other by filename.
+            if doc.get("$id"):
+                pairs.append((doc["$id"], res))
+            pairs.append((name + ".schema.json", res))
+            if name == "ecc":
+                ecc = doc
+        cls.validator = Draft202012Validator(ecc, registry=Registry().with_resources(pairs))
+
+    def _errors(self, ecc):
+        return sorted(e.message for e in self.validator.iter_errors(ecc))
+
+    def test_every_compiled_ecc_validates(self):
+        """The whole reference run, not one hand-built object."""
+        h = Harness(firewalls=2)
+        now = time.time()
+        plain = h.governed_flow(dict(READ, target="orders-db"), now)
+        auth = h.c1.issue_authorization(EXPORT, now)
+        exception = h.governed_flow(EXPORT, now, authorization=auth)
+
+        eccs = [r["ecc"] for r in (plain, exception) if r.get("ecc") is not None]
+        self.assertEqual(len(eccs), 2, "expected a plain and an exception ECC")
+        for ecc in eccs:
+            self.assertEqual(self._errors(ecc), [],
+                             "compiled ECC does not validate against ecc.schema.json")
+
+    def test_ecc_action_is_a_grounded_governed_action(self):
+        """§4.5.1 and the schema: ecc.action is C3's output, and it is GROUNDED.
+
+        Asserted separately from the schema sweep because it is the substantive claim.
+        An ECC carrying the raw request rather than the grounded action would satisfy a
+        reader skimming the field names and satisfy nothing else: the grounding record
+        is what makes the contract reconstructable.
+        """
+        h = Harness()
+        ecc = h.governed_flow(dict(READ, target="orders-db"), time.time())["ecc"]
+        action = ecc["ecc.action"]
+        self.assertEqual(action["gga.semantic_result"], "GROUNDED")
+        for field in ("gga.request_id", "gga.type", "gga.target", "gga.parameters",
+                      "gga.resolved_entities", "gga.unresolved_refs"):
+            self.assertIn(field, action)
+        self.assertEqual(action["gga.unresolved_refs"], [])
+
+    def test_timestamps_are_date_times_not_epoch_floats(self):
+        h = Harness()
+        ecc = h.governed_flow(dict(READ, target="orders-db"), time.time())["ecc"]
+        for field in ("ecc.compiled_at", "ecc.expires_at"):
+            self.assertIsInstance(ecc[field], str, "%s must be a date-time" % field)
+            datetime.datetime.fromisoformat(ecc[field])   # raises if not ISO 8601
+
+    def test_no_undeclared_top_level_properties(self):
+        """ecc.schema.json sets additionalProperties: false, so a stray field is a
+        conformance failure and not a harmless extra."""
+        h = Harness()
+        ecc = h.governed_flow(dict(READ, target="orders-db"), time.time())["ecc"]
+        for stray in ("action_class", "subject_id", "target"):
+            self.assertNotIn(stray, ecc,
+                             "%s is the raw request leaking into the contract" % stray)
 
 
 if __name__ == "__main__":

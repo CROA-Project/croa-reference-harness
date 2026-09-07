@@ -10,6 +10,7 @@ counter that produced them.
 """
 import time
 
+from .components import request_of
 from .delegation import Scope, issue_token, new_session_id
 from .evidence import EvidencePack, NegativeTestResult
 from .harness import Harness
@@ -231,7 +232,9 @@ def nt008_authority_non_expansion():
     attributable = True
     for ev in _events(h, "EXECUTION_AUTHORIZED"):
         subject = ev["event.subject_id"]
-        op = ev["event.action_spec"]
+        # event.action_spec is the grounded governed action; the concrete operation a
+        # scope is tested against is its projection (§4.5.1).
+        op = request_of(ev["event.action_spec"])
         own = h.surface.scope_of(subject)
         held, _ = (own.permits(op, now) if own else (False, "no role"))
         if not held:
