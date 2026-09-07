@@ -1,9 +1,9 @@
 name: tests
 
-# The harness carries an adversarial suite — including two 100-thread races on
-# authorization reservation and commitment redemption. Those are exactly the tests that
-# fail intermittently if the atomicity is wrong, so they must run on every push, not only
-# on the maintainer's machine. Before September 2026 this repository had no CI at all,
+# The harness carries an adversarial suite — including two 100-thread races on ECC and
+# authorization redemption, and a forked multi-process race on the shared registry. Those
+# are exactly the tests that fail intermittently if the atomicity is wrong, so they must
+# run on every push, not only on the maintainer's machine. Before September 2026 this repository had no CI at all,
 # which is recorded as an open gap in the CROA repository's GOVERNANCE-DEVIATIONS.md.
 
 on:
@@ -60,8 +60,31 @@ jobs:
         run: |
           for i in $(seq 1 25); do
             python -m unittest \
-              tests.test_mrh.TestAdversarial.test_h01_concurrent_reservation_admits_one \
-              tests.test_mrh.TestAdversarial.test_h01_concurrent_redemption_admits_one \
+              tests.test_mrh.TestRedemptionRegistry.test_concurrent_redemption_admits_exactly_one \
+              tests.test_mrh.TestRedemptionRegistry.test_concurrent_authorization_admits_exactly_one \
+              tests.test_mrh.TestRedemptionRegistry.test_file_lock_registry_is_linearizable_across_processes \
               || { echo "Concurrency test failed on iteration $i"; exit 1; }
           done
           echo "25 iterations, no interleaving admitted more than one."
+
+  schema-conformance:
+    # The join between the two repositories. The specification says what a v1.0.1
+    # governance event is; this harness is the thing that has to emit one. Running the
+    # published event.schema.json against every event the harness produces is what
+    # catches a field renamed on one side and not the other -- which is precisely how
+    # the cc.* -> ecc.* migration could have gone wrong.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: CROA-Project/CROA
+          path: CROA
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install 'jsonschema>=4.18' referencing
+      - name: Validate every emitted event against the published schema
+        env:
+          CROA_SCHEMA_DIR: ${{ github.workspace }}/CROA/spec/schemas
+        run: python -m unittest tests.test_mrh.TestEventSchemaConformance -v

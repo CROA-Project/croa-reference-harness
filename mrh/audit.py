@@ -1,92 +1,122 @@
 """C5 — Audit & Provenance Store: append-only, hash-chained, signed governance events.
-Signatures use HMAC with a DEMO key — this is a demonstrator, not real key management.
 
-September 2026 — verify() was corrected after an independent audit (H-04). It previously
-recomputed the chain and each signature and did nothing else, so a log containing two
-authorized executions from one single-use authorization verified as valid. It now performs
-the causal correlation Appendix G.2.4 requires.
+v1.0.1. Three changes from the previous version, all of them driven by the §4.7.1
+field table rather than by taste:
+
+  * `event.emitter_signature` is now `event.signature`, and every event carries the
+    full signature block -- `event.signer_id`, `event.signer_epoch`,
+    `event.signature_algorithm`.
+  * `CC_COMPILED` is `ECC_COMPILED`, `event.cc_id` is `event.ecc_id`, and the block
+    reasons are the `ECC_*` set.
+  * The three effect-attestation types exist: `EXECUTION_COMPLETED`,
+    `EXECUTION_FAILED` and `EFFECT_ATTESTED`. They are emitted post-execution and say
+    what actually happened on the target system, which `EXECUTION_AUTHORIZED` does
+    not: authorizing an operation and the operation having an effect are different
+    facts, and only the second is evidence of an effect.
+
+The store writes through `mrh.wal.WriteAheadLog` (Appendix R), so recording an event
+is a durable local commit and not an in-memory append. `emit()` returns only after
+that commit, which is what makes it usable as the I6 gate: the caller may admit the
+next governed action once `emit()` has returned, and not before.
 """
-import hashlib
-import hmac
-import json
-import uuid
 import datetime
+import uuid
 
-_DEMO_KEY = b"CROA-MRH-DEMO-KEY-not-for-production"
+from .wal import CentralStore, LocalSigner, Replicator, WriteAheadLog, canon, sha256
+
 GENESIS = "0" * 64
 
+# §4.7.1, closed enumeration.
+EVENT_TYPES = (
+    "PERMIT", "DENY", "ECC_COMPILED", "EXECUTION_AUTHORIZED", "EXECUTION_BLOCKED",
+    "CONTEXT_FAILURE", "TRAJECTORY_ALERT", "ADMISSION_REJECTED", "QUALIFICATION",
+    "POLICY_ARTIFACT_ISSUED", "EXECUTION_COMPLETED", "EXECUTION_FAILED",
+    "EFFECT_ATTESTED",
+)
 
-def _canon(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+# §4.7.1 lists five; §4.8 requires the sixth and NT-007 tests it. The gap between the
+# two is recorded in the v1.0.1 defect register.
+BLOCK_REASONS = (
+    "ECC_EXPIRED", "ECC_INTEGRITY_INVALID", "ECC_NOT_FOUND", "ECC_INVARIANT_STALE",
+    "ECC_ALREADY_REDEEMED", "AUTHORIZATION_ALREADY_REDEEMED",
+)
 
 
-def _sha(s):
-    return hashlib.sha256(s.encode()).hexdigest()
+class AuditStore(object):
+    """C5. Durable, append-only, hash-chained.
 
+    `path` puts the write-ahead log on disk with a real fsync per event; the default
+    keeps it in memory for tests. `replicate_to` attaches a central store so a scenario
+    can exercise the asynchronous half of Appendix R.
+    """
 
-class AuditStore:
-    """Append-only, tamper-evident C5 event log."""
+    def __init__(self, path=None, signer=None, replicate_to=None, max_lag=64):
+        self.signer = signer or LocalSigner()
+        self.wal = WriteAheadLog(self.signer, path=path)
+        self.central = replicate_to if replicate_to is not None else CentralStore(self.signer)
+        self.replicator = Replicator(self.wal, self.central, max_lag=max_lag)
 
-    def __init__(self):
-        self.events = []
-        self._prev = GENESIS
+    # ------------------------------------------------------------------ record
+    @property
+    def events(self):
+        return self.wal.records
 
     def emit(self, etype, emitter_id, subject_id, **fields):
-        ev = {
+        """Record one governance event and durably commit it.
+
+        Returns after the local durable write, so a caller may treat the return as the
+        I6 gate: "recorded in C5 synchronously with its occurrence and before the next
+        governed action is admitted for evaluation" (§4.7).
+        """
+        if etype not in EVENT_TYPES:
+            raise ValueError("%r is not a v1.0.1 event.type (§4.7.1)" % etype)
+        br = fields.get("event.block_reason")
+        if br is not None and br not in BLOCK_REASONS:
+            raise ValueError("%r is not a v1.0.1 event.block_reason (§4.7.1, §4.8)" % br)
+
+        event = {
             "event.id": "evt-" + uuid.uuid4().hex[:16],
             "event.type": etype,
             "event.timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "event.subject_id": subject_id,
             "event.emitter_id": emitter_id,
-            "event.chain_hash": self._prev,
         }
-        ev.update(fields)
-        # sign over all fields except the signature itself
-        ev["event.emitter_signature"] = hmac.new(
-            _DEMO_KEY, _canon(ev).encode(), hashlib.sha256
-        ).hexdigest()
-        self.events.append(ev)
-        self._prev = _sha(_canon(ev))
-        return ev
+        event.update(fields)
+        return self.wal.append(event)
 
-    # ------------------------------------------------------------------ integrity
+    # --------------------------------------------------------------- integrity
     def verify_chain(self):
-        """Recompute the chain and signatures. Returns (ok, message).
+        """Recompute the chain and the signatures.
 
-        This is what verify() used to be, and on its own it establishes only that the
-        events present were not altered or reordered — not that they describe a coherent
-        sequence of decisions.
+        On its own this establishes only that the events present were not altered or
+        reordered -- not that they describe a coherent sequence of decisions. That is
+        what `verify_decisions` is for, and keeping the two apart is the point: a log
+        can be perfectly intact and still record an impossible history.
         """
-        prev = GENESIS
-        for ev in self.events:
-            if ev["event.chain_hash"] != prev:
-                return False, f"chain break at {ev['event.id']}"
-            unsigned = {k: v for k, v in ev.items() if k != "event.emitter_signature"}
-            sig = hmac.new(_DEMO_KEY, _canon(unsigned).encode(), hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(sig, ev["event.emitter_signature"]):
-                return False, f"bad signature at {ev['event.id']}"
-            prev = _sha(_canon(ev))
-        return True, f"chain verified: {len(self.events)} events, unbroken"
+        return self.wal.verify()
 
-    # --------------------------------------------------------------- correlation
+    # ------------------------------------------------------------- correlation
     def verify_decisions(self):
-        """FIX H-04 — Appendix G.2.4 correlation. Returns (ok, message).
+        """Causal correlation over the record (Appendix G.2.4). Returns (ok, message).
 
-        Checks, in one pass:
-          1. every CC_COMPILED cites a permit_event_id that is an earlier PERMIT;
-          2. at most one CC_COMPILED per permit event;
-          3. every EXECUTION_AUTHORIZED cites a cc_id compiled earlier;
-          4. **at most one EXECUTION_AUTHORIZED per cc_id**;
-          5. **at most one EXECUTION_AUTHORIZED per auth_id** — the check that catches
-             H-01, where one single-use authorization backed two admitted executions;
-          6. the subject on an EXECUTION_AUTHORIZED matches the subject on the
-             CC_COMPILED it derives from — the check that catches H-02.
+        In one pass:
+          1. every ECC_COMPILED cites a permit event that precedes it;
+          2. at most one ECC_COMPILED per permit event;
+          3. every EXECUTION_AUTHORIZED cites an ECC compiled earlier;
+          4. at most one EXECUTION_AUTHORIZED per ecc.id  (§4.8 single-use);
+          5. at most one EXECUTION_AUTHORIZED per auth_id (§4.8 governed exception);
+          6. the executing subject is the subject the ECC was compiled for;
+          7. every effect-attestation event cites an ECC that was authorized.
+
+        Checks 4 and 5 are the ones that catch a redemption race: a registry that
+        granted twice leaves two EXECUTION_AUTHORIZED events behind, and no amount of
+        chain integrity hides that.
         """
-        permits = {}          # event.id -> PERMIT event
-        compiled = {}         # cc_id -> CC_COMPILED event
-        permit_compiled = {}  # permit_event_id -> cc_id
-        executed_cc = {}      # cc_id -> EXECUTION_AUTHORIZED event
-        executed_auth = {}    # auth_id -> EXECUTION_AUTHORIZED event
+        permits = {}
+        compiled = {}
+        permit_compiled = {}
+        executed_ecc = {}
+        executed_auth = {}
 
         for ev in self.events:
             t = ev["event.type"]
@@ -94,55 +124,72 @@ class AuditStore:
             if t == "PERMIT":
                 permits[ev["event.id"]] = ev
 
-            elif t == "CC_COMPILED":
+            elif t == "ECC_COMPILED":
                 pid = ev.get("event.permit_event_id")
                 if pid is None:
-                    return False, f"CC_COMPILED {ev['event.id']} cites no permit event"
+                    return False, "ECC_COMPILED %s cites no permit event" % ev["event.id"]
                 if pid not in permits:
-                    return False, (f"CC_COMPILED {ev['event.id']} cites permit {pid}, "
-                                   "which does not precede it")
+                    return False, ("ECC_COMPILED %s cites permit %s, which does not "
+                                   "precede it" % (ev["event.id"], pid))
                 if pid in permit_compiled:
-                    return False, (f"permit {pid} produced more than one commitment: "
-                                   f"{permit_compiled[pid]} and {ev.get('event.cc_id')}")
-                permit_compiled[pid] = ev.get("event.cc_id")
-                compiled[ev["event.cc_id"]] = ev
+                    return False, ("permit %s produced more than one ECC: %s and %s"
+                                   % (pid, permit_compiled[pid], ev.get("event.ecc_id")))
+                permit_compiled[pid] = ev.get("event.ecc_id")
+                compiled[ev["event.ecc_id"]] = ev
 
             elif t == "EXECUTION_AUTHORIZED":
-                cid = ev.get("event.cc_id")
-                if cid not in compiled:
-                    return False, (f"EXECUTION_AUTHORIZED {ev['event.id']} cites commitment "
-                                   f"{cid}, which was never compiled in this record")
-                if cid in executed_cc:
-                    return False, f"commitment {cid} was authorized more than once"
-                executed_cc[cid] = ev
+                eid = ev.get("event.ecc_id")
+                if eid not in compiled:
+                    return False, ("EXECUTION_AUTHORIZED %s cites ECC %s, which was never "
+                                   "compiled in this record" % (ev["event.id"], eid))
+                if eid in executed_ecc:
+                    return False, "ECC %s was authorized more than once" % eid
+                executed_ecc[eid] = ev
 
-                if compiled[cid]["event.subject_id"] != ev["event.subject_id"]:
-                    return False, (f"commitment {cid} was compiled for "
-                                   f"{compiled[cid]['event.subject_id']} but executed as "
-                                   f"{ev['event.subject_id']}")
+                if compiled[eid]["event.subject_id"] != ev["event.subject_id"]:
+                    return False, ("ECC %s was compiled for %s but executed as %s"
+                                   % (eid, compiled[eid]["event.subject_id"],
+                                      ev["event.subject_id"]))
 
                 aid = ev.get("event.auth_id")
                 if aid is not None:
                     if aid in executed_auth:
-                        return False, (f"authorization {aid} backed more than one execution "
-                                       f"({executed_auth[aid]['event.cc_id']} and {cid})")
+                        return False, ("authorization %s backed more than one execution "
+                                       "(%s and %s)"
+                                       % (aid, executed_auth[aid]["event.ecc_id"], eid))
                     executed_auth[aid] = ev
 
-        return True, (f"decisions correlated: {len(permits)} permits, "
-                      f"{len(compiled)} commitments, {len(executed_cc)} executions, "
-                      f"{len(executed_auth)} governed exceptions, each at most once")
+            elif t in ("EXECUTION_COMPLETED", "EXECUTION_FAILED", "EFFECT_ATTESTED"):
+                eid = ev.get("event.ecc_id")
+                if eid not in executed_ecc:
+                    return False, ("%s %s attests an effect for ECC %s, which was never "
+                                   "authorized" % (t, ev["event.id"], eid))
+
+        return True, ("decisions correlated: %d permits, %d ECCs, %d executions, "
+                      "%d governed exceptions, each at most once"
+                      % (len(permits), len(compiled), len(executed_ecc), len(executed_auth)))
 
     def verify(self):
-        """Full verification: integrity *and* causal correlation. Returns (ok, message)."""
+        """Integrity and correlation. Returns (ok, message)."""
         ok, msg = self.verify_chain()
         if not ok:
             return False, msg
         ok2, msg2 = self.verify_decisions()
         if not ok2:
             return False, msg2
-        return True, f"{msg}; {msg2}"
+        return True, "%s; %s" % (msg, msg2)
+
+    # ------------------------------------------------------------ replication
+    def replicate(self):
+        """Appendix R steps 7-9. Never called on the admission path."""
+        return self.replicator.flush()
+
+    def reconcile(self):
+        """R.4 invariant 7: local WAL and central store must agree."""
+        return self.replicator.reconcile()
 
     def dump(self, path):
-        with open(path, "w") as f:
+        import json
+        with open(path, "w", encoding="utf-8") as fh:
             for ev in self.events:
-                f.write(json.dumps(ev) + "\n")
+                fh.write(json.dumps(ev, sort_keys=True) + "\n")
