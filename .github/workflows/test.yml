@@ -46,6 +46,17 @@ jobs:
       - name: Run the test suite
         run: python -m unittest discover -s tests -v
 
+      - name: Publish the Evidence Pack as a build artifact
+        if: matrix.python-version == '3.12'
+        run: python -m mrh > /dev/null && test -f evidence_pack.json
+      - uses: actions/upload-artifact@v4
+        if: matrix.python-version == '3.12'
+        with:
+          name: evidence-pack
+          path: |
+            evidence_pack.json
+            c5_log.jsonl
+
   races:
     # The concurrency tests are the ones most likely to pass by luck. Running them
     # repeatedly is cheap and is the only way a scheduling-dependent regression surfaces
@@ -87,4 +98,6 @@ jobs:
       - name: Validate every emitted event against the published schema
         env:
           CROA_SCHEMA_DIR: ${{ github.workspace }}/CROA/spec/schemas
-        run: python -m unittest tests.test_mrh.TestEventSchemaConformance -v
+        run: |
+          python -m unittest tests.test_mrh.TestEventSchemaConformance -v
+          python -m unittest tests.test_mrh.TestAppendixQ tests.test_mrh.TestEvidencePack -v

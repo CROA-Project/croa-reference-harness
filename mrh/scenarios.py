@@ -16,6 +16,7 @@ import time
 
 from .components import _ECC_KEY, _canon
 from .harness import Harness
+from .nt_appendix_q import evidence_pack_scenario, nt005, nt006, nt008
 from .redemption import FileLockRegistry, InProcessRegistry
 from .wal import LocalSigner
 
@@ -484,7 +485,10 @@ ALL = [
     nt003_replay_blocked,
     nt004_unregistered_context_blocked,
     nt004b_resolver_unavailable_fail_closed,
+    nt005,
+    nt006,
     nt007_governed_exception_single_use,
+    nt008,
     exception_scope_enforced_independently,
     shared_registry_across_firewalls,
     registry_claim_is_all_or_nothing,
@@ -499,4 +503,5 @@ ALL = [
     h03_content_addressed_id,
     h04_double_authorization_detected,
     h04b_orphan_execution_detected,
+    evidence_pack_scenario,
 ]

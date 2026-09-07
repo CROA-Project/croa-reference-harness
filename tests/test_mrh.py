@@ -399,3 +399,139 @@ class TestEventSchemaConformance(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAppendixQ(unittest.TestCase):
+    """NT-005, NT-006 and NT-008, each checked against its own numbered pass criteria.
+
+    The scenario functions return the criteria dict as well as the verdict, so a failure
+    names the criterion that did not hold rather than only reporting that the test failed.
+    """
+
+    def _assert_all(self, result):
+        (name, ok, detail), harness, checks = result
+        failed = [k for k, v in checks.items() if not v]
+        self.assertEqual(failed, [], "%s: criteria that do not hold: %s" % (name, failed))
+        self.assertTrue(ok, detail)
+        return harness
+
+    def test_nt005_ambiguous_e3_denied(self):
+        from mrh.nt_appendix_q import nt005_ambiguous_e3_denied
+        self._assert_all(nt005_ambiguous_e3_denied())
+
+    def test_nt006_trajectory_alert_then_deny(self):
+        from mrh.nt_appendix_q import nt006_trajectory_alert_then_deny
+        self._assert_all(nt006_trajectory_alert_then_deny())
+
+    def test_nt008_authority_non_expansion(self):
+        from mrh.nt_appendix_q import nt008_authority_non_expansion
+        self._assert_all(nt008_authority_non_expansion())
+
+    def test_e3_ambiguous_is_never_permitted(self):
+        """Part I §2.6 fail-deny, stated as a property rather than as one scenario:
+        whatever else is true, an AMBIGUOUS verdict must not yield a PERMIT."""
+        from mrh.invariants import AMBIGUOUS, E3Analyzer, Invariant, InvariantRegistry
+        analyzer = E3Analyzer("stub-1.0").stub("anything", AMBIGUOUS)
+        registry = InvariantRegistry([
+            Invariant("I-X", "undecidable", evaluability="E3", analyzer=analyzer)])
+        h = Harness(invariants=registry, context=("t",))
+        r = h.governed_flow({"subject_id": "a", "action_class": "x", "target": "t",
+                             "payload_key": "anything"}, time.time())
+        self.assertEqual(r["outcome"], "DENIED")
+        self.assertEqual(r["decision_basis"], "AMBIGUOUS")
+        self.assertEqual([e for e in h.c5.events if e["event.type"] == "PERMIT"], [])
+
+    def test_c4_unavailable_is_fail_deny(self):
+        """§4.6: 'implementations MUST NOT default to fail-permit behavior under C4
+        unavailability', and the deny_reason must name C4 as the cause."""
+        from mrh.invariants import Invariant, InvariantRegistry
+        registry = InvariantRegistry([
+            Invariant("I-CUM", "cumulative", evaluability="E2", trajectory_profile="TP-C",
+                      aggregate={"function": "sum", "field": "n",
+                                 "alert_threshold": 10, "hard_limit": 20,
+                                 "window": "session"})])
+        h = Harness(invariants=registry, context=("t",))
+        h.c4.available = False
+        r = h.governed_flow({"subject_id": "a", "action_class": "x", "target": "t",
+                             "n": 1}, time.time())
+        self.assertEqual(r["outcome"], "DENIED")
+        self.assertIn("C4 unavailable", r["reason"])
+
+    def test_delegation_subset_test_on_each_dimension(self):
+        """D3's five dimensions, each failing on its own.
+
+        The parameter-constraints direction is the one worth asserting explicitly:
+        the narrower predicate is the subset, so a token that *drops* a constraint the
+        delegator holds is widening, not narrowing."""
+        from mrh.delegation import Scope
+        now = time.time()
+        base = Scope("O", {"a", "b"}, {"t1", "t2"}, {"a": {"x"}}, (now, now + 100), "v1")
+        cases = {
+            "action_classes": Scope("S", {"c"}, {"t1"}, {"a": {"x"}}, (now, now + 50), "v1"),
+            "targets": Scope("S", {"a"}, {"t3"}, {"a": {"x"}}, (now, now + 50), "v1"),
+            "parameter_constraints": Scope("S", {"a"}, {"t1"}, {}, (now, now + 50), "v1"),
+            "validity_window": Scope("S", {"a"}, {"t1"}, {"a": {"x"}}, (now, now + 500), "v1"),
+            "invariant_context": Scope("S", {"a"}, {"t1"}, {"a": {"x"}}, (now, now + 50), "v2"),
+        }
+        for dimension, narrower in cases.items():
+            ok, failed = base.contains(narrower)
+            self.assertFalse(ok, "%s widening was accepted" % dimension)
+            self.assertEqual(failed, dimension)
+        good = Scope("S", {"a"}, {"t1"}, {"a": {"x"}}, (now, now + 50), "v1")
+        self.assertEqual(base.contains(good), (True, None))
+
+    def test_scope_round_trips_through_its_recorded_form(self):
+        """The admission path rebuilds the scope from what the token carries, so the
+        recorded form has to be lossless for the dimensions the subset test reads."""
+        from mrh.delegation import Scope
+        now = time.time()
+        s = Scope("S", {"a"}, {"t1"}, {"a": {"x"}}, (now, now + 50), "v1")
+        back = Scope.from_dict("S", s.as_dict())
+        self.assertEqual(back.action_classes, s.action_classes)
+        self.assertEqual(back.targets, s.targets)
+        self.assertEqual(back.parameter_constraints, {"a": ["x"]})
+        self.assertEqual(back.invariant_context, "v1")
+
+    def test_incomparable_constraint_profile_fails_deny(self):
+        """§L.3: an incomparable policy model is a fail-deny, not a best effort."""
+        from mrh.delegation import DelegationRejected, Scope
+        recorded = Scope("S", {"a"}, {"t"}, {}, (0, 10), "v1").as_dict()
+        recorded["parameter_constraints"]["profile"] = "someone-elses-profile/2"
+        self.assertRaises(DelegationRejected, Scope.from_dict, "S", recorded)
+
+
+class TestEvidencePack(unittest.TestCase):
+    """Appendix Q Part 1."""
+
+    def test_pack_is_built_from_the_record(self):
+        import tempfile
+        from mrh.nt_appendix_q import build_evidence_pack
+        path = os.path.join(tempfile.mkdtemp(), "evidence-pack.json")
+        pack, results = build_evidence_pack(path)
+        built = pack.build()
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(built["negative_test_summary"]["failed"], 0)
+        self.assertEqual(built["negative_test_summary"]["executed"], 3)
+        self.assertTrue(built["verification"]["chain_integrity"]["ok"])
+        self.assertTrue(built["verification"]["decision_correlation"]["ok"])
+        for name, ok, detail in results:
+            self.assertTrue(ok, "%s: %s" % (name, detail))
+
+    def test_pack_states_what_it_does_not_establish(self):
+        """A pack that only reports what held would be a marketing document. Part VI
+        §29.4 draws the line between chain integrity and C5 completeness, and the pack
+        has to draw it too."""
+        from mrh.nt_appendix_q import build_evidence_pack
+        pack, _ = build_evidence_pack()
+        limits = pack.build()["verification"]["does_not_establish"]
+        self.assertTrue(any("every governed action produced an event" in x for x in limits))
+        self.assertTrue(any("same program" in x for x in limits))
+
+    def test_worked_examples_cover_the_recorded_types(self):
+        from mrh.nt_appendix_q import build_evidence_pack
+        pack, _ = build_evidence_pack()
+        built = pack.build()
+        types = set(e["event.type"] for e in built["worked_examples"])
+        self.assertEqual(len(types), len(built["worked_examples"]),
+                         "worked examples must be one per type")
+        self.assertLessEqual(types, set(built["event_coverage"]))

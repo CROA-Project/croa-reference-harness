@@ -32,7 +32,17 @@ def main():
     print("\nSample C5 log written to c5_log.jsonl (%d events)" % len(h.c5.events))
     print("Verification: %s \u2014 %s" % ("OK" if ok else "FAILED", msg))
     print("Replication:  %s \u2014 %s" % ("OK" if rec_ok else "FAILED", rec_msg))
-    return 0 if passed == len(scenarios.ALL) and ok and rec_ok else 1
+
+    # Appendix Q Part 1: the pack an assessor is handed, extracted from a real run.
+    from .nt_appendix_q import build_evidence_pack
+    pack, _ = build_evidence_pack("evidence_pack.json")
+    print("\nEvidence Pack written to evidence_pack.json")
+    print(pack.summary())
+    built = pack.build()
+    pack_ok = (built["negative_test_summary"]["failed"] == 0
+               and built["verification"]["chain_integrity"]["ok"]
+               and built["verification"]["decision_correlation"]["ok"])
+    return 0 if passed == len(scenarios.ALL) and ok and rec_ok and pack_ok else 1
 
 
 if __name__ == "__main__":

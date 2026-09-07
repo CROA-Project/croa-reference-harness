@@ -100,7 +100,11 @@ decision in **C5**:
 | **NT-002** | An ECC past its validity is blocked (`ECC_EXPIRED`) — and refusing it does **not** consume its single use. |
 | **NT-003** | A redeemed ECC cannot be reused (`ECC_ALREADY_REDEEMED`), and the resulting log still verifies. |
 | **NT-004** | An action against an unregistered target is stopped at C3; C2 is never reached. An unavailable C3 fails closed too. |
+| **NT-005** | An `E3` analyzer that returns `AMBIGUOUS` produces a `DENY` whose `event.decision_basis` is `AMBIGUOUS` and which records the pinned `event.analyzer_version`. Fail-deny is a recorded decision, not a silent one. |
+| **NT-006** | Five permitted exports of 90 subjects reach the 450 alert threshold; C4 raises a `TRAJECTORY_ALERT` after the fifth; the sixth would reach 510 against a hard limit of 500 and is denied, its `trajectory_state_id` linking back to the alert. The cumulative total is recomputed from C5 alone. |
 | **NT-007** | All four steps: first use admitted, a second ECC on the same authorization refused, an out-of-scope target refused, and two concurrent presentations to two C6 instances admitting exactly one. |
+| **NT-008** | I8 in both clauses. (a) A delegation within `O`'s scope is admitted — the control case, without which the test is vacuous — while tokens widening the action class, target, parameter constraints, validity window or depth each fail deny on their own. (b) Four laundering arrangements, in which `S` submits an action only `O` holds, are all refused at the Agent Surface, including `S` presenting `O`'s own ECC at the boundary. |
+| Evidence Pack | Appendix Q Part 1, assembled from the C5 record of a real run rather than from a template: worked examples per event type, the three negative-test reports in the Q.1.8 shape, and a verification block that states what the pack does **not** establish. |
 
 **Adversarial** — the mechanism refusing when called incorrectly. These are the ones that matter:
 
@@ -153,6 +157,38 @@ The two are deliberately separate. §4.8: "the linearizable redemption authority
 MUST commit ahead of, asynchronous evidence materialization." Conflating them is the specific error
 the section warns against, so the registry lives in `mrh/redemption.py` and the evidence path in
 `mrh/wal.py`, and neither imports the other.
+
+## What v1.0.1 adds beyond the boundary
+
+Lot 2 made the execution boundary conformant. The tests that need more than a boundary
+need three components the harness did not have.
+
+**An `E3` analyzer that is allowed to not know.** Rice's theorem denies an exact, total,
+deterministic procedure for a semantic property of arbitrary content, so `mrh/invariants.py`
+gives the analyzer three outcomes rather than two and a declared budget beyond which it
+must return `AMBIGUOUS`. Part I §2.6 then makes that a deny. The pinned version travels
+onto every decision it took part in as `event.analyzer_version` — without it, two decisions
+on identical inputs that differ because the analyzer changed are indistinguishable from a
+determinism failure.
+
+**C4, which watches sequences.** `mrh/trajectory.py` implements the four trajectory rule
+profiles of §4.6.3, and the cumulative ones (`TP-C`, `TP-X`) are where the interesting
+failure lives: an aggregate crossing a threshold is not visible to any single-action check.
+Two details are normative rather than convenient. The agent's self-reported state is not an
+input, so only an action that actually completed accumulates — otherwise an agent drives
+the counter to its limit with requests that were all refused. And C4 being unavailable is
+fail-deny, with `event.deny_reason` naming C4 as the cause.
+
+**Governed delegation, and the two ways I8 fails.** `mrh/delegation.py` implements the D3
+canonical scope profile and its five-dimension subset test. Clause (a) — attenuation — is
+that test. Clause (b) — no laundering — is not in this module at all: it is the Agent
+Surface refusing an action class the *submitting* subject does not hold, before any
+component that could be persuaded has seen the request. That is why NT-008 Part B applies
+to every deployment, delegating or not.
+
+The subtlety that is easy to invert: parameter constraints compose by logical implication,
+not by set inclusion. The narrower predicate is the subset. Getting it backwards admits
+every widening token, so the direction is asserted dimension by dimension in the tests.
 
 ## The audit log
 

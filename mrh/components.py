@@ -33,6 +33,9 @@ import hmac
 import json
 import uuid
 
+from .invariants import AMBIGUOUS, VIOLATED, Invariant, InvariantRegistry
+from .trajectory import C4Unavailable
+
 _ECC_KEY = b"CROA-MRH-ECC-DEMO-KEY"
 
 
@@ -58,20 +61,56 @@ class PolicyAuthority(object):
     artifacts for governed exceptions (§4.3.1). The agent can never issue these."""
 
     def __init__(self, approved_export_targets, invariant_set_version="inv-2026-09-01",
-                 policy_artifact_id="pol-core-data-protection@1.4.0"):
+                 policy_artifact_id="pol-core-data-protection@1.4.0", registry=None):
         self.approved_export_targets = set(approved_export_targets)
-        self.invariant_set_version = invariant_set_version
         # §4.7.1 requires every decision event to name the C1 artifact it was issued
         # under, so a decision can be re-derived years later against the policy that
         # actually applied to it (I3).
         self.policy_artifact_id = policy_artifact_id
+        self.registry = registry if registry is not None else self._default_registry()
+        self.registry.version = invariant_set_version
+
+    @property
+    def invariant_set_version(self):
+        return self.registry.version
+
+    @invariant_set_version.setter
+    def invariant_set_version(self, value):
+        self.registry.version = value
+
+    def _default_registry(self):
+        """The one registered invariant the base scenarios need, as a registry entry.
+
+        Written as an entry rather than as a hard-coded branch because Part III §9.1
+        makes the declared properties -- evaluability class, trajectory profile,
+        reversibility -- part of what an invariant *is*. A rule with no declared
+        evaluability class cannot be reasoned about by C2 and cannot be re-derived by
+        an auditor.
+        """
+        approved = self.approved_export_targets
+        return InvariantRegistry([
+            Invariant(
+                "I-EXPORT-001",
+                "data.export MUST target an approved destination",
+                evaluability="E1", trajectory_profile="TP-0", reversibility="R2",
+                predicate=lambda a: (a["action_class"] == "data.export"
+                                     and a["target"] not in approved)),
+        ])
 
     def violated_invariants(self, action):
-        v = []
-        if (action["action_class"] == "data.export"
-                and action["target"] not in self.approved_export_targets):
-            v.append("I-EXPORT-001")   # data.export target must be an approved destination
-        return v
+        """Kept for the callers that only need the identifiers of what was violated."""
+        violated = []
+        for inv in self.registry.applicable(action):
+            verdict, _ = inv.evaluate(action)
+            if verdict == VIOLATED:
+                violated.append(inv.id)
+        return violated
+
+    def invariant_text(self, identifier):
+        try:
+            return self.registry[identifier].statement
+        except KeyError:
+            return None
 
     def issue_authorization(self, action, now, ttl=60, waived=("I-EXPORT-001",)):
         """Issue a single-use authorization bounded to one action class and target.
@@ -140,36 +179,95 @@ class PathResolver(object):
 
 # --- C2: Execution Governor ----------------------------------------------
 class ExecutionGovernor(object):
-    """Deterministic permit-or-deny evaluation (§4.4.2)."""
+    """Deterministic permit-or-deny evaluation (§4.4.2).
 
-    def __init__(self, c1, registry=None):
+    The ordered procedure, and why the order is what it is:
+
+      1. evaluate every applicable registered invariant;
+      2. an AMBIGUOUS verdict from an E2/E3 method denies immediately (Part I §2.6
+         fail-deny) -- before any authorization is considered, because an authorization
+         waives a *known* violation and cannot waive an unknown one;
+      3. consult C4 for trajectory state; a cumulative hard-limit breach denies;
+      4. a known violation denies, unless a valid unspent C1 authorization covers it.
+
+    Swapping 2 and 4 would let a governed exception paper over a verdict nobody has;
+    swapping 3 and 4 would let an authorization for a single action override a
+    cumulative limit it was never scoped against.
+    """
+
+    def __init__(self, c1, registry=None, c4=None):
         self.c1 = c1
         # Advisory only: lets C2 deny early on an authorization it can already see is
         # spent, which NT-007 step 2 accepts as an alternative to a block at C6. It is
         # never the guarantee -- the guarantee is the atomic claim at the boundary.
         self.registry = registry
+        self.c4 = c4
 
-    def evaluate(self, action, authorization, now):
+    def evaluate(self, action, authorization, now, session_id=None):
         """Returns (decision, reason, invariant_state).
 
         `invariant_state` is the §4.7.1 field: on a DENY it names the violated
         invariants, on a PERMIT it attests that none was violated. Returning it from
         the evaluator rather than reconstructing it at the log is deliberate -- an
         attestation assembled by the recorder is an attestation about the recorder.
+        It also carries `analyzer_version` where an E3 method took part, which §4.7.1
+        requires on the event and I2 requires for determinism across time.
         """
-        violations = self.c1.violated_invariants(action)
+        violations, ambiguous, analyzer_versions, evaluated = [], [], [], []
+        for inv in self.c1.registry.applicable(action):
+            verdict, analyzer_version = inv.evaluate(action)
+            evaluated.append(inv.id)
+            if analyzer_version is not None:
+                analyzer_versions.append(analyzer_version)
+            if verdict == VIOLATED:
+                violations.append(inv.id)
+            elif verdict == AMBIGUOUS:
+                ambiguous.append(inv.id)
+
+        base = {"violated": violations, "evaluated": evaluated}
+        if analyzer_versions:
+            base["analyzer_version"] = analyzer_versions[0]
+
+        # 2 -- fail-deny on an undecided verdict (Part I §2.6)
+        if ambiguous:
+            state = dict(base, ambiguous=ambiguous,
+                         attestation="E3 verdict AMBIGUOUS; fail-deny applied")
+            return ("DENY_AMBIGUOUS",
+                    "ambiguous verdict for " + ",".join(ambiguous) + " (fail-deny)",
+                    state)
+
+        # 3 -- trajectory state. C4 unavailability is fail-deny (§4.6).
+        if self.c4 is not None and session_id is not None:
+            try:
+                traj = self.c4.assess(action, session_id)
+            except C4Unavailable as exc:
+                return ("DENY", "C4 unavailable: %s" % exc,
+                        dict(base, attestation="invariant state unavailable; fail-deny"))
+            base["trajectory"] = traj["states"]
+            if traj["alert"] is not None:
+                base["trajectory_alert"] = traj["alert"]
+            if traj["breach"] is not None:
+                b = traj["breach"]
+                return ("DENY",
+                        "%s trajectory hard limit breached: %d + %d = %d > %d"
+                        % (b["invariant_id"], b["current_value"], b["increment"],
+                           b["projected"], b["hard_limit"]),
+                        dict(base, violated=[b["invariant_id"]],
+                             trajectory_state_id=b["trajectory_state_id"],
+                             breach=b))
+
+        # 4 -- known violation, and the governed exception
         if not violations:
             return ("PERMIT", "no registered invariant violated",
-                    {"violated": [], "attestation": "no registered invariant violated"})
+                    dict(base, attestation="no registered invariant violated"))
         if not self.c1.authorization_valid_for(authorization, action, now):
-            return ("DENY", "violates " + ",".join(violations), {"violated": violations})
+            return ("DENY", "violates " + ",".join(violations), base)
         if self.registry is not None and self.registry.is_spent(authorization["auth_id"]):
             return ("DENY", "authorization %s already redeemed" % authorization["auth_id"],
-                    {"violated": violations})
+                    base)
         return ("PERMIT_WITH_AUTHORIZATION", "covered by " + authorization["auth_id"],
-                {"violated": violations,
-                 "waived_under": authorization["auth_id"],
-                 "attestation": "violation waived by a valid C1 authorization"})
+                dict(base, waived_under=authorization["auth_id"],
+                     attestation="violation waived by a valid C1 authorization"))
 
 
 # --- C7: Contract Compiler ------------------------------------------------
@@ -331,3 +429,77 @@ class ExecutionFirewall(object):
                       else "AUTHORIZATION_ALREADY_REDEEMED")
             return "BLOCKED", reason, result.conflict_key
         return "AUTHORIZED", None, None
+
+
+# --- Agent Surface --------------------------------------------------------
+class AgentSurface(object):
+    """The sole interface a governed agent has to the OCP (§4.9), and the three
+    admission controls that stand in front of everything else.
+
+    §4.9.1, the subject authorization model, is the load-bearing one for I8 clause (b):
+
+        "a governed action request with action type a, submitted by subject s, is
+        admitted if and only if some role assigned to s includes a in its authorized
+        action classes ... A request that fails the admission predicate MUST be rejected
+        at the Agent Surface ... MUST NOT be forwarded to C3 or C2."
+
+    That is what makes authority laundering structurally impossible rather than merely
+    unlikely: `S` submitting an action only `O` holds is refused here, before any
+    component that could be persuaded has seen it. No arrangement of subjects helps,
+    because the predicate reads the *submitting* subject's own roles and nothing else --
+    not the session, not a cited prior decision, not a free-text claim about `O`.
+
+    Delegation does not relax the predicate. A delegated action must lie within the
+    delegated scope **and** independently pass evaluation (D3): the token narrows what
+    `S` may do, it never widens it.
+    """
+
+    def __init__(self, roles=None, qualification=None):
+        # subject_id -> Scope. A subject with no entry holds nothing.
+        self.roles = dict(roles or {})
+        # subject_id -> bool, standing in for the AQL (§4.9.2). OPTIONAL for human
+        # subjects, REQUIRED at L5 for agent subjects exercising autonomous authority.
+        self.qualification = dict(qualification or {})
+
+    def scope_of(self, subject_id):
+        return self.roles.get(subject_id)
+
+    def admit(self, action, now, delegation=None):
+        """Returns (admitted, rejection_reason, detail).
+
+        `rejection_reason` is a value of the §4.7.1 closed enumeration, so a refusal is
+        recordable as an ADMISSION_REJECTED event without inventing a reason code.
+        """
+        required = ("subject_id", "action_class", "target")
+        if any(k not in action for k in required):
+            return False, "SCHEMA_VIOLATION", "missing one of %s" % (required,)
+        # §4.5.1: the agent MUST NOT include stated reasoning, urgency assertions or
+        # compliance self-reports. T6: stated intent is not an input to the decision, so
+        # the surface refuses the request rather than ignoring the field -- a field that
+        # is accepted and ignored is a field someone will eventually read.
+        for banned in ("reasoning", "urgency", "justification", "approval",
+                       "asserted_authority", "compliance_self_report"):
+            if banned in action:
+                return False, "SCHEMA_VIOLATION", "request carries %r" % banned
+
+        subject_scope = self.roles.get(action["subject_id"])
+        if subject_scope is None:
+            return False, "UNAUTHORIZED_ACTION_CLASS", "subject holds no role"
+
+        if delegation is not None:
+            # The delegated scope bounds the action, and the subject must still hold the
+            # class independently unless the delegation granted it -- D3: "The OCP MUST
+            # admit an action by S only if it is within scope(S) AND independently passes
+            # C2.eval against policy and invariants."
+            ok, dimension = delegation.permits(action, now)
+            if not ok:
+                return False, "UNAUTHORIZED_ACTION_CLASS", "outside delegated %s" % dimension
+            return True, None, None
+
+        ok, dimension = subject_scope.permits(action, now)
+        if not ok:
+            return False, "UNAUTHORIZED_ACTION_CLASS", "outside subject %s" % dimension
+
+        if self.qualification and not self.qualification.get(action["subject_id"], True):
+            return False, "UNQUALIFIED", "subject is not currently qualified"
+        return True, None, None
