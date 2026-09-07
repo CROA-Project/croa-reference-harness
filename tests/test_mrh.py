@@ -1,3 +1,4 @@
+import datetime
 import hashlib
 import hmac
 import os
@@ -395,6 +396,105 @@ class TestEventSchemaConformance(unittest.TestCase):
                          "EXECUTION_BLOCKED", "CONTEXT_FAILURE", "EXECUTION_COMPLETED",
                          "EFFECT_ATTESTED"):
             self.assertIn(required, seen)
+
+
+class TestEccSchemaConformance(unittest.TestCase):
+    """Every ECC the harness compiles must validate against the published
+    ecc.schema.json.
+
+    H-03's other half. The event half of that defect was closed in September 2026 and
+    the ECC half was not, for a reason worth stating: **no test looked**. The event
+    conformance test above passed throughout, and a green suite covering the object
+    beside the broken one is what kept anyone from checking. This class exists so that
+    the ECC cannot drift from its schema without something going red.
+
+    ecc.schema.json `$ref`s gga.schema.json, so the four schemas are loaded into a
+    registry rather than validated in isolation -- which is also what makes this test
+    check the thing that actually matters: `ecc.action` must be a *grounded governed
+    action*, not whatever dictionary the caller happened to pass in.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from jsonschema import Draft202012Validator
+            from referencing import Registry, Resource
+        except ImportError:
+            raise unittest.SkipTest("jsonschema >= 4.18 not installed")
+        import json
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidates = [os.environ.get("CROA_SCHEMA_DIR"),
+                      os.path.join(here, "..", "CROA", "spec", "schemas")]
+        d = None
+        for c in candidates:
+            if c and os.path.exists(os.path.join(c, "ecc.schema.json")):
+                d = c
+                break
+        if d is None:
+            raise unittest.SkipTest("ecc.schema.json not found (set CROA_SCHEMA_DIR)")
+        pairs, ecc = [], None
+        for name in ("gar", "gga", "ecc", "event"):
+            with open(os.path.join(d, name + ".schema.json"), encoding="utf-8") as fh:
+                doc = json.load(fh)
+            res = Resource.from_contents(doc)
+            # Registered under both the declared $id and the bare filename, because the
+            # schemas reference each other by filename.
+            if doc.get("$id"):
+                pairs.append((doc["$id"], res))
+            pairs.append((name + ".schema.json", res))
+            if name == "ecc":
+                ecc = doc
+        cls.validator = Draft202012Validator(ecc, registry=Registry().with_resources(pairs))
+
+    def _errors(self, ecc):
+        return sorted(e.message for e in self.validator.iter_errors(ecc))
+
+    def test_every_compiled_ecc_validates(self):
+        """The whole reference run, not one hand-built object."""
+        h = Harness(firewalls=2)
+        now = time.time()
+        plain = h.governed_flow(dict(READ, target="orders-db"), now)
+        auth = h.c1.issue_authorization(EXPORT, now)
+        exception = h.governed_flow(EXPORT, now, authorization=auth)
+
+        eccs = [r["ecc"] for r in (plain, exception) if r.get("ecc") is not None]
+        self.assertEqual(len(eccs), 2, "expected a plain and an exception ECC")
+        for ecc in eccs:
+            self.assertEqual(self._errors(ecc), [],
+                             "compiled ECC does not validate against ecc.schema.json")
+
+    def test_ecc_action_is_a_grounded_governed_action(self):
+        """§4.5.1 and the schema: ecc.action is C3's output, and it is GROUNDED.
+
+        Asserted separately from the schema sweep because it is the substantive claim.
+        An ECC carrying the raw request rather than the grounded action would satisfy a
+        reader skimming the field names and satisfy nothing else: the grounding record
+        is what makes the contract reconstructable.
+        """
+        h = Harness()
+        ecc = h.governed_flow(dict(READ, target="orders-db"), time.time())["ecc"]
+        action = ecc["ecc.action"]
+        self.assertEqual(action["gga.semantic_result"], "GROUNDED")
+        for field in ("gga.request_id", "gga.type", "gga.target", "gga.parameters",
+                      "gga.resolved_entities", "gga.unresolved_refs"):
+            self.assertIn(field, action)
+        self.assertEqual(action["gga.unresolved_refs"], [])
+
+    def test_timestamps_are_date_times_not_epoch_floats(self):
+        h = Harness()
+        ecc = h.governed_flow(dict(READ, target="orders-db"), time.time())["ecc"]
+        for field in ("ecc.compiled_at", "ecc.expires_at"):
+            self.assertIsInstance(ecc[field], str, "%s must be a date-time" % field)
+            datetime.datetime.fromisoformat(ecc[field])   # raises if not ISO 8601
+
+    def test_no_undeclared_top_level_properties(self):
+        """ecc.schema.json sets additionalProperties: false, so a stray field is a
+        conformance failure and not a harmless extra."""
+        h = Harness()
+        ecc = h.governed_flow(dict(READ, target="orders-db"), time.time())["ecc"]
+        for stray in ("action_class", "subject_id", "target"):
+            self.assertNotIn(stray, ecc,
+                             "%s is the raw request leaking into the contract" % stray)
 
 
 if __name__ == "__main__":
