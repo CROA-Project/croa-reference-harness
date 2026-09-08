@@ -1,6 +1,10 @@
 [project]
 name = "croa-reference-harness"
-version = "0.3.0"
+# Bound to the CROA specification version this harness demonstrates, not to the
+# maturity of the harness. 1.0.1 here means "demonstrates specification v1.0.1";
+# spec/known-defects-harness.md is where a reader learns what it does and does not
+# establish, and it currently meets five of its eight exit criteria.
+version = "1.0.1"
 description = "CROA Minimal Reference Harness — a vendor-neutral demonstrator of CROA enforcement (stdlib only)."
 requires-python = ">=3.8"
 license = { text = "Apache-2.0" }
