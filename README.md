@@ -32,8 +32,8 @@ what each defect was and what remains open, is
 | **H-02** | A commitment compiled for one subject was admitted under another; the presented operation was never compared to the commitment | **fixed** |
 | **H-03** | `ecc.id` mixed a random UUID into the digest, so it was not a content address | **fixed** |
 | **H-04** | `verify()` recomputed the chain and did no causal correlation, so the H-01 log verified as valid | **fixed** |
-| **H-05** | No `C4` (trajectory state), no admission layer | **open** |
-| **H-06** | No network boundary, so property P4 is not demonstrated | **open** |
+| **H-05** | No `C4` (trajectory state), no admission layer | **partly closed** — `C4`, `E3`, delegation, and role/scope authorization are present; authentication of the supplied subject identity remains absent |
+| **H-06** | No network boundary, so property P4 is not demonstrated | **partly closed** — P4 mechanism is demonstrated using OS process isolation and external effect assertions, but this does not establish a real deployment network boundary |
 | **H-07** | The scenario suite was entirely cooperative | **partly closed** — an adversarial group now exists; more is welcome |
 
 **One correction the README owed you.** This file previously said a signed authorization admits
@@ -226,32 +226,15 @@ tests/test_mrh.py  # scenario, adversarial and concurrency tests (stdlib unittes
 
 Stated plainly, because the gaps are more useful to a contributor than the passing scenarios are.
 
-- **No `C4`, no trajectory state** — so **NT-006** is not implemented, and no cumulative constraint is
-  ever evaluated (H-05).
-- **No admission layer** — no authentication, no RBAC, no Agent Qualification Level. `subject_id` is
-  taken as authentic because the harness has nothing that could authenticate it (H-05).
-- **No `E3` semantic analyzer** — so **NT-005** (ambiguous verdict → fail-closed deny) is absent.
-- **No delegation model** — so **NT-008** (authority non-expansion) is absent. H-02 covers only the
-  base case of subject substitution, not delegation.
-- **No network boundary and no governed system.** `C6` returns a verdict; it does not perform an
-  operation, and there is no second path that must be shown to be unreachable. NT-001 shows that a
-  call with no contract is refused — **not** that a non-ECC execution is structurally impossible.
-  This is the most load-bearing condition of CROA's central claim, and the harness does not test it
-  at all (H-06).
-- **No cross-process or cross-instance state.** The atomic reservation is a `threading.Lock` in one
-  process. A real deployment needs one shared authority — a conditional write, a compare-and-swap, or
-  a transaction — visible to every `C6` and `C7`. The concurrency tests here prove the *shape* of the
-  guarantee, not that it survives distribution.
-- **No schema validation.** Commitments and events still do not validate against the specification's
-  JSON schemas (H-03's remaining half). This is the next thing worth fixing.
+- **No authentication.** While `C4`, `E3`, delegation, and role/scope admission checks (authorization) are now present, authentication of `subject_id` is not provided by the harness. The harness assumes the presented subject identity is authentic (H-05).
+- **No deployment-grade network boundary.** A P4 mechanism is demonstrated using process isolation, where the governed system is reachable only through the C6 gateway inside the bench and assertions are made on the governed-system-owned log. However, this is NOT equivalent to demonstrating deployment-grade network containment. A real deployment must establish the boundary using its actual network, host, and execution controls (H-06).
+- **No cross-host redemption deployment demonstrated.** The harness demonstrates shared redemption across threads (`InProcessRegistry`) and across multiple processes on a single host (`FileLockRegistry`). However, a production multi-host shape depends on an external linearizable conditional-write / CAS / transactional authority. The harness does not demonstrate a real multi-host deployment of that authority.
+- **No integrated C5 post-execution evidence on the P4 path.** `P4Bench` demonstrates execution through the isolated C6 gateway and the governed system's own log, while the Harness in-process path produces the integrated `EXECUTION_AUTHORIZED`, `EXECUTION_COMPLETED`, and `EFFECT_ATTESTED` C5 events. The current demonstrator does not yet join those two evidence paths into one C5 post-execution chain (H-09).
 
 **Good first contributions**, roughly in order of value:
 
-1. Make the harness's commitments and events validate against `spec/schemas/`, and fail CI on drift.
-2. A real network boundary and a target system, so P4 can be tested on external effects (H-06).
-3. A minimal `C4` and NT-006.
-4. A delegation model and NT-008.
-5. Multi-process concurrency against a shared redemption store.
+1. Independent authentication of subject identities (H-05).
+2. Integrate P4 external execution with the Harness C5 post-execution event path (H-09).
 
 ## Contributing
 
