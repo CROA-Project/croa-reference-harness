@@ -17,6 +17,8 @@ Companion to the **CROA — Constrained Reachability Orchestration Architecture*
 ([DOI 10.5281/zenodo.21063423](https://doi.org/10.5281/zenodo.21063423)). Published by **The CROA
 Project**. License: **Apache-2.0**.
 
+> **Versioning note:** The package version (`1.0.1`) identifies the CROA specification version demonstrated by this reference harness. It is not a claim of production maturity or production readiness; supported properties and remaining limitations are documented explicitly below and in the known-defects register.
+
 ---
 
 ## September 2026 — three defects found, four fixed
