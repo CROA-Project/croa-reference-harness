@@ -1,0 +1,10 @@
+prune tests
+prune private_inputs
+prune private_scenario_models
+prune private_results
+prune .github
+exclude .env*
+exclude c5_log.jsonl
+exclude evidence_pack.json
+global-exclude __pycache__
+global-exclude *.py[cod]

@@ -1,10 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "croa-reference-harness"
-# Bound to the CROA specification version this harness demonstrates, not to the
-# maturity of the harness. 1.0.1 here means "demonstrates specification v1.0.1";
-# spec/known-defects-harness.md is where a reader learns what it does and does not
-# establish, and it currently meets five of its eight exit criteria.
-version = "1.0.1"
+dynamic = ["version"]
 description = "CROA Minimal Reference Harness — a vendor-neutral demonstrator of CROA enforcement (stdlib only)."
+readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "Apache-2.0" }
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/CROA-Project/croa-reference-harness"
+Repository = "https://github.com/CROA-Project/croa-reference-harness.git"
+"Issue Tracker" = "https://github.com/CROA-Project/croa-reference-harness/issues"
+
+[tool.setuptools.dynamic]
+version = {attr = "mrh.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["mrh", "mrh.*"]
+exclude = ["tests*", "private_*"]
