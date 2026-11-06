@@ -427,6 +427,13 @@ class ExecutionGovernor(object):
                     dict(base, attestation="no registered invariant violated"))
         if not self.c1.authorization_valid_for(authorization, action, now):
             return ("DENY", "violates " + ",".join(violations), base)
+        # §4.4.2 step 5: the authorization must cover the violation, not merely exist.
+        # §4.3.1 has it name the invariants it overrides, so one it does not name stands.
+        uncovered = sorted(set(violations)
+                           - set(authorization["exception_scope"]["waived_invariants"]))
+        if uncovered:
+            return ("DENY", "violates %s, not covered by %s"
+                    % (",".join(uncovered), authorization["auth_id"]), base)
         if self.registry is not None and self.registry.is_spent(authorization["auth_id"]):
             return ("DENY", "authorization %s already redeemed" % authorization["auth_id"],
                     base)
