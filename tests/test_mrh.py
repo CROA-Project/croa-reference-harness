@@ -10,6 +10,7 @@ import unittest
 from mrh import scenarios
 from mrh.components import _ECC_KEY, AuthorizationInvalid, ExecutionFirewall, _canon
 from mrh.harness import Harness
+from mrh.invariants import Invariant, InvariantRegistry
 from mrh.redemption import InProcessRegistry
 from mrh.wal import LocalSigner
 
@@ -246,6 +247,47 @@ class TestAdversarial(unittest.TestCase):
         n = sum(1 for e in self.h.c5.events if e["event.type"] == "EXECUTION_AUTHORIZED")
         self.assertEqual(n, 1)
         self.assertEqual(len(self.h.applied("billing")), 1)
+
+    # ----------------------------------------------- §4.4.2 step 5 waiver coverage
+    def _two_invariant_harness(self):
+        return Harness(invariants=InvariantRegistry([
+            Invariant("INV-A", "payload MUST NOT be flagged a", evaluability="E1",
+                      predicate=lambda a: bool(a.get("flag_a"))),
+            Invariant("INV-B", "payload MUST NOT be flagged b", evaluability="E1",
+                      predicate=lambda a: bool(a.get("flag_b"))),
+        ]))
+
+    def _report(self, **flags):
+        return dict({"subject_id": "cs-agent-01", "action_class": "report.generate",
+                     "target": "reporting-api"}, **flags)
+
+    def test_waiver_of_another_invariant_does_not_cover_the_violation(self):
+        h = self._two_invariant_harness()
+        action = self._report(flag_b=True)
+        auth = h.c1.issue_authorization(action, self.now, waived=("INV-A",))
+        r = h.governed_flow(dict(action), self.now, authorization=auth)
+        self.assertFalse(r.get("admitted", False))
+        self.assertEqual(r["decision_basis"], "DENY")
+        self.assertIn("INV-B", r["reason"])
+        self.assertEqual(h.applied("reporting-api"), [])
+        self.assertFalse(h.registry.is_spent(auth["auth_id"]))
+
+    def test_partial_waiver_does_not_cover_every_violation(self):
+        h = self._two_invariant_harness()
+        action = self._report(flag_a=True, flag_b=True)
+        auth = h.c1.issue_authorization(action, self.now, waived=("INV-A",))
+        r = h.governed_flow(dict(action), self.now, authorization=auth)
+        self.assertFalse(r.get("admitted", False))
+        self.assertEqual(h.applied("reporting-api"), [])
+
+    def test_waiver_naming_every_violation_is_admitted(self):
+        h = self._two_invariant_harness()
+        action = self._report(flag_a=True, flag_b=True)
+        auth = h.c1.issue_authorization(action, self.now, waived=("INV-A", "INV-B"))
+        r = h.governed_flow(dict(action), self.now, authorization=auth)
+        self.assertTrue(r["admitted"])
+        self.assertEqual(r["decision_basis"], "PERMIT_WITH_AUTHORIZATION")
+        self.assertEqual(len(h.applied("reporting-api")), 1)
 
     def test_expired_authorization_never_compiles(self):
         auth = self.h.c1.issue_authorization(EXPORT, self.now, ttl=1)
