@@ -33,3 +33,5 @@ version = {attr = "mrh.__version__"}
 [tool.setuptools.packages.find]
 include = ["mrh", "mrh.*"]
 exclude = ["tests*", "private_*"]
+[project.scripts]
+croa = "mrh.cli:main"

@@ -64,17 +64,29 @@ boundary that can be called without an identity will eventually be called withou
 
 ---
 
-## Run it (≤ 2 minutes)
+## Run it (≈ 2 minutes)
 
 Requires Python ≥ 3.8. No dependencies.
+
+When running from a source checkout, the legacy demonstrator is available:
 
 ```
 make demo      # or:  python3 -m mrh
 make test      # run the scenario and adversarial tests
 ```
 
-You will see twelve scenarios pass, a sample `C5` event log written to `c5_log.jsonl`, and the audit
-chain verified — chain *and* decision correlation.
+You will see 25 scenarios pass, a sample `C5` event log written to `c5_log.jsonl`, an Evidence Pack written to `evidence_pack.json`, and the audit chain verified — chain *and* decision correlation.
+
+When the built package is installed, the public CLI is available:
+
+```
+croa --version
+croa demo
+croa demo permit
+croa demo deny
+croa demo replay
+croa test
+```
 
 ## What it demonstrates
 
