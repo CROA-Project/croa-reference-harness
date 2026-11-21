@@ -82,18 +82,22 @@ class Harness(object):
                 except DelegationRejected as exc:
                     return self._reject(action, session_id, gar_id,
                                         "UNAUTHORIZED_ACTION_CLASS", str(exc),
-                                        exc.dimension, delegation_hops)
+                                        exc.dimension, delegation_hops,
+                                        refusal=("DELEGATION_TOKEN", exc.dimension))
                 ok, reason, dimension = verify_token(
                     delegation_token, authorizing, delegated_scope, now)
                 if not ok:
                     return self._reject(action, session_id, gar_id,
                                         "UNAUTHORIZED_ACTION_CLASS", reason, dimension,
-                                        delegation_hops)
+                                        delegation_hops,
+                                        refusal=("DELEGATION_TOKEN", dimension))
             admitted, rejection, detail = self.surface.admit(
                 action, now, delegation=delegated_scope)
             if not admitted:
                 return self._reject(action, session_id, gar_id, rejection, detail,
-                                    None, delegation_hops)
+                                    None, delegation_hops,
+                                    refusal=self._admission_refusal(
+                                        action, now, rejection, delegated_scope))
 
         # §4.5.1: C3 produces the grounded governed action, it does not answer yes or
         # no. Everything downstream carries `gga` from here, and `ecc.action` is
@@ -225,8 +229,43 @@ class Harness(object):
         )
 
     # ------------------------------------------------------------- admission
-    def _reject(self, action, session_id, gar_id, reason, detail, dimension, hops):
-        """ADMISSION_REJECTED (§4.9.1). The request is not forwarded to C3 or C2."""
+    def _admission_refusal(self, action, now, rejection, delegated_scope):
+        """FIX (admission-rejection evidence): which admission control refused, as
+        (rejection_basis, rejection_dimension).
+
+        `AgentSurface.admit` reports the failing dimension only inside its free-text
+        detail ("outside subject targets"), and both a class and a target refusal carry
+        the same §4.7.1 reason code, UNAUTHORIZED_ACTION_CLASS (§4.9.1). The reason code
+        is kept -- the enumeration is closed -- and the dimension is re-derived here
+        with the same public, side-effect-free `Scope.permits` calls `admit` makes, in
+        the same order (subject role, then delegated scope, else subject scope), so the
+        recorded dimension is the one that refused. Non-normative fields, like the
+        existing `rejection_detail` and `failed_scope_dimension`.
+        """
+        if rejection == "SCHEMA_VIOLATION":
+            return "SCHEMA", "schema"
+        if rejection == "UNQUALIFIED":
+            return "QUALIFICATION", "qualification"
+        subject_scope = self.surface.scope_of(action.get("subject_id"))
+        if subject_scope is None:
+            return "SUBJECT_SCOPE", "role"
+        if delegated_scope is not None:
+            return "DELEGATED_SCOPE", delegated_scope.permits(action, now)[1]
+        return "SUBJECT_SCOPE", subject_scope.permits(action, now)[1]
+
+    def _reject(self, action, session_id, gar_id, reason, detail, dimension, hops,
+                refusal=None):
+        """ADMISSION_REJECTED (§4.9.1). The request is not forwarded to C3 or C2.
+
+        FIX (admission-rejection evidence): the event also carries the attempted target as the
+        structured field `attempted_target`, and `rejection_basis` /
+        `rejection_dimension` say which control refused -- the subject's own scope, a
+        delegated scope or the delegation token -- and on which dimension, so a class
+        refusal and a target refusal are distinguishable in C5 without parsing free
+        text. §4.7.1 defines `event.attempted_type` and the closed
+        `event.rejection_reason` enumeration for this event; both are unchanged, and
+        the new fields are non-normative extensions, not new enumeration values.
+        """
         fields = {
             "event.session_id": session_id,
             "event.attempted_type": action.get("action_class"),
@@ -235,6 +274,13 @@ class Harness(object):
             "governance_outcome": "GOVERNANCE_SUCCESS",
             "rejection_detail": detail,
         }
+        if "target" in action:
+            fields["attempted_target"] = action["target"]
+        rejection_basis = rejection_dimension = None
+        if refusal is not None:
+            rejection_basis, rejection_dimension = refusal
+            fields["rejection_basis"] = rejection_basis
+            fields["rejection_dimension"] = rejection_dimension
         if dimension is not None:
             fields["failed_scope_dimension"] = dimension
         if hops:
@@ -242,7 +288,10 @@ class Harness(object):
         self.c5.emit("ADMISSION_REJECTED", "AgentSurface", action["subject_id"], **fields)
         return {"outcome": "REJECTED", "stage": "AgentSurface", "reason": detail or reason,
                 "rejection_reason": reason, "gar_id": gar_id,
-                "failed_scope_dimension": dimension}
+                "failed_scope_dimension": dimension,
+                "attempted_target": action.get("target"),
+                "rejection_basis": rejection_basis,
+                "rejection_dimension": rejection_dimension}
 
     def present(self, ecc, now, subject_id, operation=None, firewall=None,
                 apply_effect=True, delegation_hops=None):
